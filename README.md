@@ -190,6 +190,39 @@ Full scenes are used without cropping; if a scene exceeds GPU memory, add an
 explicit training crop strategy rather than silently dropping evaluation points.
 Part B in `run_lab1.py` still needs to be wired separately.
 
+## C1 fitting baseline
+
+`lab1.splatting.fit_splats` now connects Gaussian initialization to the
+`gsplat==1.5.3` rasterizer pinned in `environment.yml`. The API follows the
+[versioned renderer source](https://github.com/nerfstudio-project/gsplat/blob/v1.5.3/gsplat/rendering.py).
+It uses a fixed Gaussian count, degree-0 spherical harmonics, a black background,
+L1 RGB loss, and Adam with a shared learning rate. It does not split or prune
+Gaussians. These choices describe a simple baseline, not the full original
+3DGS training recipe.
+
+```python
+from lab1.splatting import fit_splats
+
+model = fit_splats(
+    train_images, train_camera_to_world_poses, intrinsics,
+    initial_points=points,       # (N, 3) world coordinates, metres
+    initial_colors=colors,       # (N, 3) RGB floats in [0, 1]
+    n_iterations=30000,
+    device="cuda", lr=0.001, seed=0, log_every=100,
+)
+print(model.summary())
+```
+
+Initial points and colors must come from training data only, not the ground-truth
+evaluation mesh or held-out views. Supply at least two finite points. Fit time
+includes initialization, image transfers, optimization and any first-use kernel
+compilation. Peak GPU memory is PyTorch's maximum allocated memory, including
+all live tensors on the device. The returned `SplatModel` contains NumPy arrays
+with physical scales, opacity in [0, 1], and scalar-last unit quaternions.
+Held-out rendering, PSNR/SSIM/LPIPS evaluation, saving, and the Part C runner
+connection still need to be implemented separately. No fitting or tests were
+run when this integration was written.
+
 ## The contract tests
 
 ```bash
@@ -285,6 +318,8 @@ AI assistance was used substantially to implement the Part B model factory,
 sparse U-Net, and model smoke tests.
 It was also used for the Part B training, evaluation, voxel-size ablation,
 and their usage documentation.
+AI assistance was used to integrate the C1 Gaussian initialization, rendering,
+optimization loop, and export to the course's `SplatModel` conventions.
 
 Permitted, per the course policy. You are responsible for everything you submit:
 if you cannot explain a line of your code in office hours, it does not count as

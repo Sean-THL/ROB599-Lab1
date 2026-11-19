@@ -144,8 +144,172 @@ def fit_splats(images, poses, intrinsics, n_iterations: int = 30_000, **kwargs) 
     count, wall-clock fit time, and peak GPU memory. Held-out means held out --
     if the fit ever saw those views, every number in your report is optimistic
     and the comparison against the other two representations is void.
+
+    Required kwargs: initial_points (N, 3), world-frame metres, and
+    initial_colors (N, 3), RGB floats in [0, 1], from training data only.
+    Optional kwargs: device="cuda", lr=0.001, seed=0, log_every=100.
+
+    Simple baseline: fixed Gaussian count, degree-0 SH, black background,
+    and an L1 image loss. No splitting, pruning, or camera optimization.
+    Fit time includes initialization, image transfers, and optimization;
+    first-use CUDA kernel compilation, if needed, is also included.
+    Peak memory is PyTorch-allocated memory, including all live device tensors.
+    Held-out rendering and image metrics are performed separately after fitting.
     """
-    raise NotImplementedError("Lab 1 C1: fit the 3DGS model")
+    import numpy as np
+    import torch
+    import time
+    from scipy.spatial import cKDTree
+    from gsplat import rasterization
+    from rob498.se3 import inverse
+
+    initial_points = kwargs.pop("initial_points", None)
+    initial_colors = kwargs.pop("initial_colors", None)
+    device = torch.device(kwargs.pop("device", "cuda"))
+    lr = kwargs.pop("lr", 0.001)
+    seed = kwargs.pop("seed", 0)
+    log_every = kwargs.pop("log_every", 100)
+    if kwargs:
+        raise TypeError(f"Unknown fitting options: {sorted(kwargs)}")
+    if initial_points is None or initial_colors is None:
+        raise ValueError("Provide initial_points and initial_colors from training data")
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise ValueError("fit_splats requires an available CUDA GPU")
+    if not isinstance(n_iterations, int) or n_iterations < 1:
+        raise ValueError("n_iterations must be a positive integer")
+    if not np.isfinite(lr) or lr <= 0:
+        raise ValueError("lr must be positive and finite")
+    if not isinstance(log_every, int) or log_every < 0:
+        raise ValueError("log_every must be a nonnegative integer; 0 disables logging")
+
+    initial_points = np.asarray(initial_points, dtype=np.float32)
+    initial_colors = np.asarray(initial_colors, dtype=np.float32)
+    images = np.asarray(images, dtype=np.float32)
+    poses = np.asarray(poses, dtype=np.float32)
+    intrinsics = np.asarray(intrinsics, dtype=np.float32)
+    if (initial_points.ndim != 2 or initial_points.shape[1] != 3
+            or len(initial_points) < 2):
+        raise ValueError("initial_points must have shape (N, 3), with N >= 2")
+    if initial_colors.shape != initial_points.shape:
+        raise ValueError("initial_colors must have the same (N, 3) shape as points")
+    if (images.ndim != 4 or images.shape[-1] != 3
+            or min(images.shape[:3]) < 1):
+        raise ValueError("images must have shape (V, H, W, 3), with V, H, W > 0")
+    if poses.shape != (len(images), 4, 4) or intrinsics.shape != (3, 3):
+        raise ValueError("Need one (4, 4) pose per image and (3, 3) intrinsics")
+    for name, array in (("points", initial_points), ("colors", initial_colors),
+                        ("images", images), ("poses", poses), ("intrinsics", intrinsics)):
+        if not np.isfinite(array).all():
+            raise ValueError(f"{name} contains non-finite values")
+    for name, array in (("colors", initial_colors), ("images", images)):
+        if array.min() < 0 or array.max() > 1:
+            raise ValueError(f"{name} must contain RGB floats in [0, 1]")
+
+    n = len(initial_points)
+    rng = np.random.default_rng(seed)
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    start = time.perf_counter()
+
+    # 1. Position: put one Gaussian at each initial point.
+    means = torch.nn.Parameter(
+        torch.as_tensor(initial_points, dtype=torch.float32, device=device).clone()
+    )
+
+    # 2. Scale: estimate each point's spacing from its nearest neighbor.
+    # The first returned neighbor is the point itself; the second is another point.
+    distance, _ = cKDTree(initial_points).query(initial_points, k=2)
+    spacing = np.maximum(distance[:, 1], 1e-4)
+
+    # Start with equal sizes along x, y, and z.
+    scales = torch.tensor(spacing, dtype=torch.float32, device=device)
+    scales = scales[:, None].repeat(1, 3)
+    log_scales = torch.nn.Parameter(torch.log(scales))
+
+    #3. Rotation: identity quaternion in gsplat's scalar-first convention (qw, qx, qy, qz).
+    rotations = torch.zeros((n, 4), device=device)
+    rotations[:, 0] = 1.0
+    quaternions = torch.nn.Parameter(rotations)
+
+    # 4. Opacity: start every Gaussian at opacity 0.1.
+    initial_opacity = torch.full((n,), 0.1, device=device)
+    opacity_logits = torch.nn.Parameter(torch.logit(initial_opacity))
+
+    # 5. Appearance: start with degree-0 spherical harmonics.
+    # This gives each Gaussian a color that does not depend on viewing direction.
+    rgb = torch.tensor(initial_colors, dtype=torch.float32, device=device)
+    C0 = 0.28209479177387814
+    sh_coeffs = torch.nn.Parameter(
+        ((rgb - 0.5) / C0).unsqueeze(1)
+    )
+
+    # 6. Cameras: convert camera-to-world poses to world-to-camera matrices.
+    viewmats = torch.tensor(
+        np.stack([inverse(pose) for pose in poses]),
+        dtype=torch.float32, device=device,
+    )
+    K = torch.tensor(intrinsics, dtype=torch.float32, device=device)
+    height, width = images.shape[1:3]
+    background = torch.zeros((1, 3), device=device)
+
+    # 7. One optimizer updates all five sets of Gaussian parameters.
+    # A shared learning rate is a simple starting point, not a tuned 3DGS recipe.
+    optimizer = torch.optim.Adam(
+        [means, log_scales, quaternions, opacity_logits, sh_coeffs], lr=lr
+    )
+
+    for step in range(n_iterations):
+        # Pick a TRAINING view. Keep the image collection on CPU to save VRAM.
+        view_index = int(rng.integers(len(images)))
+        target = torch.tensor(images[view_index], dtype=torch.float32, device=device)
+        optimizer.zero_grad(set_to_none=True)
+
+        # Convert unrestricted parameters to valid scales, rotations and opacity.
+        rendered, alpha, info = rasterization(
+            means=means,
+            quats=torch.nn.functional.normalize(quaternions, dim=-1),
+            scales=torch.exp(log_scales),
+            opacities=torch.sigmoid(opacity_logits),
+            colors=sh_coeffs,
+            viewmats=viewmats[view_index:view_index + 1],
+            Ks=K.unsqueeze(0),
+            width=width,
+            height=height,
+            sh_degree=0,
+            backgrounds=background,
+            render_mode="RGB",
+        )
+        prediction = rendered[0]  # Remove the camera dimension: (H, W, 3).
+        loss = torch.nn.functional.l1_loss(prediction, target)
+        if not torch.isfinite(loss).item():
+            raise RuntimeError(f"Non-finite image loss at step {step + 1}")
+        loss.backward()
+        optimizer.step()
+
+        if log_every and ((step + 1) % log_every == 0 or step == 0):
+            print(f"Step {step + 1}/{n_iterations} | L1 loss {loss.item():.5f}",
+                  flush=True)
+        # Release this view's rendering buffers before the next iteration.
+        del target, rendered, alpha, info, prediction, loss
+
+    torch.cuda.synchronize(device)
+    fit_time_s = time.perf_counter() - start
+    peak_gpu_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+    # 8. Export physical values in the course conventions, not training variables.
+    with torch.no_grad():
+        rotations = torch.nn.functional.normalize(quaternions, dim=-1)
+        model = SplatModel(
+            means=means.detach().cpu().numpy().copy(),
+            scales=torch.exp(log_scales).cpu().numpy(),
+            rotations=rotations[:, [1, 2, 3, 0]].cpu().numpy(),  # wxyz -> xyzw
+            opacities=torch.sigmoid(opacity_logits).cpu().numpy(),
+            sh_coeffs=sh_coeffs.detach().cpu().numpy().copy(),
+            fit_time_s=fit_time_s,
+            peak_gpu_mb=peak_gpu_mb,
+        )
+    model.validate()
+    return model
 
 
 def extract_surface(model: SplatModel, method: str = "opacity_threshold", **kwargs):
