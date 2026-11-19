@@ -96,6 +96,100 @@ numbers in your report:
 python lab1/run_lab1.py --data data/lab1 --out results/ --part b   # or c, d, e, all
 ```
 
+## Part B model
+
+`build_model("minkowski", num_classes=C)` constructs a compact residual sparse
+U-Net defined in `lab1/sparse_unet.py`, using spconv convolution primitives.
+It is a MinkowskiNet-style architecture, not an exact MinkUNet34 reproduction,
+and starts from random weights. PTv3 is not implemented.
+
+```python
+from lab1.segmentation import build_model
+
+model = build_model(num_classes=C, in_channels=3).cuda()
+logits = model(voxel_features, voxel_coordinates)  # (M, C), raw scores
+```
+
+Here `voxel_features` is a CUDA float32 tensor of shape `(M, 3)` (for example,
+mean normalized RGB per voxel). `voxel_coordinates` is a CUDA int32 tensor of
+shape `(M, 4)`, with columns `[batch, x, y, z]`. Voxel coordinates must be
+unique and nonnegative; shift each scene's quantized coordinates before batching.
+The output preserves input voxel row order. Use the provided voxelization inverse
+mapping to recover per-point predictions. Set `C` from the dataset class list.
+
+On the GPU server, after activating the lab environment, run:
+
+```bash
+python -m pytest lab1/tests/test_segmentation_model.py -v
+```
+
+The GPU test checks forward/backward execution and output correspondence after
+permuting input voxels; it skips when PyTorch, spconv or CUDA is unavailable.
+
+### Part B training and evaluation
+
+The simple training functions take lists of `SegScene` objects directly: one
+scene per step, with mean RGB features per voxel. They do not require a custom
+PyTorch DataLoader. Training and mIoU both use original point labels, including
+when several points fall into one voxel. Ignore labels are excluded.
+
+Example Python script, run from the repository root in the GPU environment:
+
+```python
+import json
+from pathlib import Path
+
+from rob498.config import set_global_seed
+from lab1.dataset import load_class_names, load_segmentation_split
+from lab1.segmentation import build_model, train, evaluate, voxel_size_ablation
+
+data = Path("data/lab1")
+out = Path("results/part_b")
+out.mkdir(parents=True, exist_ok=True)
+train_scenes = load_segmentation_split(data, "train")
+val_scenes = load_segmentation_split(data, "val")
+num_classes = len(load_class_names(data))
+models = {}
+
+for size in (0.02, 0.05, 0.10):
+    set_global_seed(0)  # Seed before creating each model's random weights.
+    model = build_model(num_classes=num_classes)
+    model, history = train(
+        model, train_scenes, val_scenes,
+        epochs=50, voxel_size=size, lr=0.001, patience=10, seed=0,
+        device="cuda", checkpoint_path=out / f"model_{size:.2f}m.pth",
+    )
+    models[size] = model
+    (out / f"history_{size:.2f}m.json").write_text(json.dumps(history, indent=2))
+
+records = voxel_size_ablation(models, val_scenes)
+(out / "ablation.json").write_text(json.dumps(records, indent=2))
+
+# Example of inspecting point-level metrics for just the 5 cm model:
+result = evaluate(models[0.05], val_scenes, voxel_size=0.05)
+print(result.metrics(num_classes))
+```
+
+Training prints loss, online training mIoU, and validation mIoU each epoch.
+It stops after `patience` epochs without improvement and restores the best
+validation weights. The returned model records `best_epoch`, `best_val_miou`,
+and `trained_voxel_size_m`. Checkpoints contain these conditions, model options,
+the best weights, and the full epoch history; they do not support optimizer
+resumption. Plot `train_miou` and `val_miou` from the history against `epoch`
+for the training curves in your report.
+
+The ablation saves `results/part_b/voxel_size_ablation.png` with mIoU and mean
+forward latency against voxel size. Pass `plot_path=...` to choose another path,
+or `plot_path=None` to return records without making a plot. Latency excludes
+voxelization, data transfer and point remapping; the first scene is warmed up.
+Reported memory is peak PyTorch-allocated GPU memory during inference in MiB,
+including all live tensors on the device. During ablation, inactive compared
+models are temporarily moved to CPU, then returned to their original devices.
+CPU evaluation reports GPU memory as zero.
+Full scenes are used without cropping; if a scene exceeds GPU memory, add an
+explicit training crop strategy rather than silently dropping evaluation points.
+Part B in `run_lab1.py` still needs to be wired separately.
+
 ## The contract tests
 
 ```bash
@@ -186,6 +280,11 @@ convention (OpenCV axes, camera-to-world), which is the one ScanNet++'s own
 `transforms.json` does *not* use.
 
 ## Generative AI
+
+AI assistance was used substantially to implement the Part B model factory,
+sparse U-Net, and model smoke tests.
+It was also used for the Part B training, evaluation, voxel-size ablation,
+and their usage documentation.
 
 Permitted, per the course policy. You are responsible for everything you submit:
 if you cannot explain a line of your code in office hours, it does not count as
