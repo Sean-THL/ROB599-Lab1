@@ -11,6 +11,159 @@ python scripts/check_env.py            # on a GPU node: python scripts/check_env
 pytest rob498/tests lab1/tests -v
 ```
 
+## Great Lakes Part B: ready to submit
+
+This workflow uses the **ScanNet20 small-subset route discussed by the GSI**,
+not the shared 2,878-class ScanNet++ export. Your prepared subset contains
+10 training scenes and 2 validation scenes, selected with seed 42 from available
+members of the official splits. Report these as subset results, not full-dataset
+benchmark results. Original coordinates and all vertices are preserved; labels
+are remapped to 0--19, with -1 ignored. Input RGB comes from the original mesh,
+never the label-visualization colors.
+
+The code below queues actual training when you choose to submit it. No jobs,
+training runs or tests were launched while preparing these scripts.
+
+First pull the committed code on **Great Lakes**, from your repository:
+
+```bash
+cd ~/ROB599-Lab1
+GIT_ASKPASS= SSH_ASKPASS= git -c credential.helper= pull origin main
+```
+
+Use a valid GitHub token at the terminal password prompt if required. Do not
+put tokens in commands, source files, logs or messages.
+
+**First short run: 5 cm, two epochs.** Keep it separate from final experiments:
+
+```bash
+ROB498_EPOCHS=2 \
+ROB498_RUN_ROOT=/scratch/engin_root/engin1/szlin/ROB599-Lab1/results/part_b_first_run \
+sbatch scripts/train_part_b.sbatch
+```
+
+Submission returns a job ID immediately. You can disconnect while it waits or
+runs. Follow its state and log (replace JOBID with the submitted number):
+
+```bash
+squeue -u szlin
+tail -f slurm-part-b-JOBID_*.out
+sacct -j JOBID --format=JobID,State,Elapsed,ExitCode,MaxRSS
+```
+
+Ctrl+C stops `tail -f`, not the job. To cancel the job, use `scancel JOBID`.
+The script requests one A40 in `spgpu`, 4 CPUs, 32 GiB system memory, and a
+2-hour walltime on `engin1`. That is a limit, not an estimate of training time.
+The allocation is released when the command finishes. The script loads the
+existing mamba module and `/home/szlin/mamba_envs/rob498`; it never installs
+packages or downloads training data on the GPU node.
+
+**Full Part B experiments:** after the short run finishes successfully,
+train separate models at 2, 5 and 10 cm. Fifty is the maximum epoch count;
+early stopping uses 10 epochs without validation improvement.
+
+```bash
+sbatch --array=0-2%1 scripts/train_part_b.sbatch
+```
+
+Array index 0 = 2 cm, 1 = 5 cm, 2 = 10 cm. `%1` runs at most one GPU job at a
+time. Each task has its own 2-hour limit. These runs start from scratch with
+training seed 42, on the same prepared subset. The default result directory is
+`/scratch/engin_root/engin1/szlin/ROB599-Lab1/results/part_b_seed42/`.
+To run only the full 5 cm model, omit `--array`.
+
+**Schedule an earliest start** by adding an actual date/time:
+
+```bash
+sbatch --begin=2026-11-24T09:00:00 --array=0-2%1 scripts/train_part_b.sbatch
+```
+
+Check `date` on Great Lakes for its time zone. `--begin` sets eligibility, not
+a guaranteed reservation: busy resources can delay the actual start.
+
+**Continue after a time limit or interruption:** each completed epoch saves
+`last.pth` with current weights, optimizer, shuffle RNG state and best weights.
+Resume the interrupted array index; for example, the 2 cm run:
+
+```bash
+sbatch --array=0 scripts/train_part_b.sbatch --resume
+```
+
+Use `--array=1` for 5 cm or `--array=2` for 10 cm. Resume requires matching
+data, scene selection, class names, model settings and seed. It restarts the
+first unfinished epoch, not the middle of a scene. CUDA kernels may still be
+nondeterministic. If no epoch finished, choose a new `ROB498_RUN_ROOT` and start
+fresh rather than requesting resume without a `last.pth`. Never submit two
+jobs writing to the same voxel-size directory simultaneously.
+
+**Build B1/B2 report artifacts after the jobs finish**, without GPU training:
+
+```bash
+module load mamba/py3.12
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate /home/szlin/mamba_envs/rob498
+python scripts/summarize_part_b.py \
+  --runs /scratch/engin_root/engin1/szlin/ROB599-Lab1/results/part_b_seed42
+```
+
+This writes a conditions-bearing Markdown/CSV table, the mIoU/latency ablation
+plot, per-class IoUs across voxel sizes, and class IoU drops from 2 to 10 cm.
+Missing voxel sizes are explicitly flagged as incomplete. It refuses to combine
+runs with different scenes or training conditions. This is lightweight reporting
+on existing files, not another model fit.
+
+**B3:** choose the classes relevant to your Part E occupancy rule and rerun
+the same reporting command with `--task-classes`. For example, if you explicitly
+choose chair, table and sofa as your task subset:
+
+```bash
+python scripts/summarize_part_b.py \
+  --runs /scratch/engin_root/engin1/szlin/ROB599-Lab1/results/part_b_seed42 \
+  --task-classes chair table sofa
+```
+
+That list is an example, not a course-required choice. Explain the selection in
+the report. No retraining is needed. Until classes are selected, B3 is marked
+unconfigured rather than reporting an invented task score.
+
+Each `voxel_*cm/` directory contains:
+
+- `best.pth`: weights selected by maximum validation mIoU.
+- `last.pth`: resumable state after the latest completed epoch.
+- `history.json` and `training_curves.png`: loss and train/validation mIoU.
+- `metrics.json` and `per_class_iou.csv`: point-level scores and timing/memory.
+- `validation_predictions.npz`: predictions, ground truth, scene offsets and
+  the confusion matrix; the rows can be separated back into individual scenes.
+- `run_config.json`, `manifest.json`, `status.json`: exact scene lists, label
+  names, preparation metadata, settings, GPU, versions, commit and completion.
+
+An absent class has undefined IoU (JSON null / blank CSV), not zero. Report
+training mIoU as online and validation mIoU as end-of-epoch. Validation selects
+the checkpoint, so it is not a separate held-out test set. Inference latency
+is mean per-scene forward time after one warm-up; it excludes voxelization,
+transfers and point remapping. GPU memory is peak PyTorch allocation. Training
+time includes training, validation and checkpointing, plus previously completed
+segments when resumed. Part E query latency is a separate measurement.
+
+`lab1/run_lab1.py --part b` is also wired for direct use in an allocated GPU shell:
+
+```bash
+python -u lab1/run_lab1.py --part b \
+  --data /scratch/engin_root/engin1/szlin/ROB599-Lab1/data/scannet20_small \
+  --out /scratch/engin_root/engin1/szlin/ROB599-Lab1/results/part_b_direct \
+  --seed 42 --b-voxel-sizes 0.05 --b-epochs 50
+```
+
+Direct-run outputs live under `<out>/part_b/`; pass that directory to the
+summary tool. Do not run this command on a login node. No tests or training
+have yet established runtime correctness or memory fit; the first short GPU
+run is needed before calling the implementation validated.
+
+For the written report, still inspect prediction quality, explain which
+classes degrade in B2 and why, justify B3's task classes, and state the subset
+and run conditions. Scripts produce measured artifacts, not those explanations.
+Parts C--E remain separate work; Part E is 40 points of the lab.
+
 ## What this is, and what it deliberately is not
 
 **Provided:** the shared `rob498/` package — SE(3) conventions, evaluation
@@ -174,8 +327,8 @@ Training prints loss, online training mIoU, and validation mIoU each epoch.
 It stops after `patience` epochs without improvement and restores the best
 validation weights. The returned model records `best_epoch`, `best_val_miou`,
 and `trained_voxel_size_m`. Checkpoints contain these conditions, model options,
-the best weights, and the full epoch history; they do not support optimizer
-resumption. Plot `train_miou` and `val_miou` from the history against `epoch`
+the best weights, and the full epoch history. A companion `last.pth` supports
+optimizer resumption with `resume_from=...`. Plot `train_miou` and `val_miou` from the history against `epoch`
 for the training curves in your report.
 
 The ablation saves `results/part_b/voxel_size_ablation.png` with mIoU and mean
@@ -188,7 +341,7 @@ models are temporarily moved to CPU, then returned to their original devices.
 CPU evaluation reports GPU memory as zero.
 Full scenes are used without cropping; if a scene exceeds GPU memory, add an
 explicit training crop strategy rather than silently dropping evaluation points.
-Part B in `run_lab1.py` still needs to be wired separately.
+Part B in `run_lab1.py` is wired; the Great Lakes batch workflow above is preferred.
 
 ## C1 fitting baseline
 
@@ -320,6 +473,8 @@ It was also used for the Part B training, evaluation, voxel-size ablation,
 and their usage documentation.
 AI assistance was used to integrate the C1 Gaussian initialization, rendering,
 optimization loop, and export to the course's `SplatModel` conventions.
+AI assistance was also used for the ScanNet20 preparation script, Part B runner,
+resumable checkpoints, Great Lakes batch script, and report-artifact generation.
 
 Permitted, per the course policy. You are responsible for everything you submit:
 if you cannot explain a line of your code in office hours, it does not count as

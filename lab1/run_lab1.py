@@ -34,6 +34,20 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=Path("results"))
     ap.add_argument("--part", choices=[*PARTS, "all"], default="all")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--b-voxel-sizes", nargs="+", type=float, default=[0.05],
+                    help="Metres; train an independent Part B model for each size")
+    ap.add_argument("--b-epochs", type=int, default=50)
+    ap.add_argument("--b-lr", type=float, default=0.001)
+    ap.add_argument("--b-weight-decay", type=float, default=0.0001)
+    ap.add_argument("--b-patience", type=int, default=10,
+                    help="Epochs without improvement; 0 disables early stopping")
+    ap.add_argument("--b-channels", nargs="+", type=int, default=[32, 64, 128, 256])
+    ap.add_argument("--b-task-classes", nargs="+",
+                    help="Exact class names for B3, chosen to match your Part E task")
+    ap.add_argument("--b-resume", action="store_true",
+                    help="Continue the last completed epoch from each last.pth")
+    ap.add_argument("--b-evaluate-only", action="store_true",
+                    help="Re-evaluate existing best.pth weights without training")
     ap.add_argument("--recon-threshold", type=float, default=0.05,
                     help="One threshold for C3 and D3, so the splat and "
                          "feed-forward numbers are comparable.")
@@ -43,7 +57,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not args.data.exists():
-        print(f"error: {args.data} does not exist. Run fetch_data.py. Note the "
+        print(f"error: {args.data} does not exist. Prepare the course data first. Note the "
               f"ScanNet++ subset needs you to have accepted the dataset terms, "
               f"which takes time to approve.", file=sys.stderr)
         return 2
@@ -70,6 +84,8 @@ def main() -> int:
             traceback.print_exc()
             failed.append(part)
 
+    manifest.add_result("completed_parts", completed)
+    manifest.add_result("failed_parts", failed)
     manifest.save(args.out)
     table.conditions = manifest.conditions_line()
     report.write_report_bundle(args.out, [table])
@@ -78,15 +94,34 @@ def main() -> int:
     print("\nReminder: three pipelines and a PSNR table is the failure mode this "
           "lab is built around. Part E is 40 points and it asks a different "
           "question than Parts B-D do.")
-    return 0
+    return 1 if failed else 0
 
 
 def _run_part(part, args, manifest, table) -> None:
     if part == "b":
         import segmentation  # noqa: F401
-        raise NotImplementedError(
-            "Part B: build_model, train, evaluate, voxel_size_ablation. Report "
-            "both fine-tuned and zero-shot numbers if you started from weights.")
+        from lab1.part_b import run_part_b
+
+        records = run_part_b(
+            args.data, args.out / "part_b", voxel_sizes=args.b_voxel_sizes,
+            epochs=args.b_epochs, lr=args.b_lr, weight_decay=args.b_weight_decay,
+            patience=None if args.b_patience == 0 else args.b_patience,
+            channels=args.b_channels, seed=args.seed,
+            task_classes=args.b_task_classes, resume=args.b_resume,
+            evaluate_only=args.b_evaluate_only,
+        )
+        manifest.add_param("part_b_dataset", str(args.data.resolve()))
+        manifest.add_param("part_b_voxel_sizes_m", args.b_voxel_sizes)
+        manifest.add_param("part_b_trials", 1)
+        manifest.add_result("part_b", records)
+        # Use 5 cm for this summary row when present; detailed results retain all sizes.
+        chosen = next((row for row in records if abs(row["voxel_size_m"] - 0.05) < 1e-8), records[0])
+        table.rows[0][1] = f"mIoU={chosen['miou']:.4f}, voxel={chosen['voxel_size_m']:g} m"
+        table.rows[0][3] = chosen["training_time_s"]
+        table.notes += (" Part B fidelity is validation point-level mIoU. Part B memory "
+                        "and query latency remain blank until the Part E occupancy "
+                        "representation is built; inference measurements are saved separately.")
+        return
     if part == "c":
         import splatting  # noqa: F401
         raise NotImplementedError(

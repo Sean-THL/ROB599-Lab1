@@ -121,11 +121,14 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
     is one training step. Both training and validation use original points.
 
     Options: voxel_size=0.05, lr=0.001, weight_decay=0.0001, patience=10,
-    seed=0, device=None, checkpoint_path=None. Set patience=None to disable
+    seed=0, device=None, checkpoint_path=None, resume_from=None,
+    history_path=None. Set patience=None to disable
     early stopping. Seed model initialization BEFORE calling build_model.
     Returns (model_with_best_validation_weights, list_of_epoch_records).
     """
     import torch
+    import json
+    import time
     from pathlib import Path
     from rob498.metrics import confusion_matrix, iou_from_confusion
 
@@ -136,6 +139,8 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
     seed = kwargs.pop("seed", 0)
     device = kwargs.pop("device", None)
     checkpoint_path = kwargs.pop("checkpoint_path", None)
+    resume_from = kwargs.pop("resume_from", None)
+    history_path = kwargs.pop("history_path", None)
     if kwargs:
         raise TypeError(f"Unknown training options: {sorted(kwargs)}")
     if epochs < 1 or (patience is not None and patience < 1):
@@ -159,9 +164,54 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
     best_state = None
     best_epoch = 0
     epochs_without_improvement = 0
+    start_epoch = 1
+    previous_time_s = 0.0
+    train_peak_memory_mb = 0.0
+    use_cuda = next(model.parameters()).device.type == "cuda"
+    run_device = next(model.parameters()).device
 
-    for epoch in range(1, epochs + 1):
+    conditions = {
+        "voxel_size_m": float(voxel_size), "num_classes": num_classes,
+        "in_channels": model.in_channels, "channels": tuple(model.channels),
+        "from_pretrained": bool(getattr(model, "from_pretrained", False)),
+        "seed": seed, "lr": lr, "weight_decay": weight_decay,
+        "train_scenes": [scene.name for scene in train_scenes],
+        "val_scenes": [scene.name for scene in val_scenes],
+    }
+    if resume_from is not None:
+        # Load only checkpoints from your own training runs.
+        saved = torch.load(resume_from, map_location="cpu", weights_only=False)
+        if "optimizer_state_dict" not in saved:
+            raise ValueError("Resume from last.pth, which includes the optimizer state")
+        for key, value in conditions.items():
+            if saved[key] != value:
+                raise ValueError(f"Resume condition changed: {key}")
+        model.load_state_dict(saved["model_state_dict"])
+        optimizer.load_state_dict(saved["optimizer_state_dict"])
+        best_state = saved["best_model_state_dict"]
+        best_epoch = saved["best_epoch"]
+        best_miou = saved["best_val_miou"]
+        history = saved["history"]
+        epochs_without_improvement = saved["epochs_without_improvement"]
+        rng.bit_generator.state = saved["shuffle_rng_state"]
+        start_epoch = saved["epoch"] + 1
+        previous_time_s = saved["elapsed_s"]
+        train_peak_memory_mb = saved["train_peak_memory_mb"]
+        del saved
+        print(f"Resuming at epoch {start_epoch}", flush=True)
+
+    if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    start_time = time.perf_counter()
+
+    for epoch in range(start_epoch, epochs + 1):
+        if patience is not None and epochs_without_improvement >= patience:
+            print("The saved run already reached the early-stopping limit", flush=True)
+            break
         model.train()
+        if use_cuda:
+            torch.cuda.reset_peak_memory_stats(run_device)
         train_cm = np.zeros((num_classes, num_classes), dtype=np.int64)
         total_loss = 0.0
         total_points = 0
@@ -182,6 +232,8 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
             # Points sharing a voxel share its scores, but keep their own labels.
             point_logits = voxel_logits[inverse[valid]]
             loss = criterion(point_logits, labels[valid])
+            if not torch.isfinite(loss).item():
+                raise RuntimeError(f"Non-finite loss in epoch {epoch}, scene {scene.name}")
             loss.backward()
             optimizer.step()
 
@@ -199,6 +251,12 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
         # Train mIoU uses predictions collected during updates; validation uses
         # the fixed weights at the end of the epoch, with BatchNorm in eval mode.
         train_miou = iou_from_confusion(train_cm)["miou"]
+        if use_cuda:
+            torch.cuda.synchronize(run_device)
+            train_peak_memory_mb = max(
+                train_peak_memory_mb,
+                torch.cuda.max_memory_allocated(run_device) / (1024 ** 2),
+            )
         optimizer.zero_grad(set_to_none=True)
         validation = evaluate(model, val_scenes, voxel_size)
         val_miou = validation.metrics(num_classes)["miou"]
@@ -209,6 +267,7 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
             "train_loss": total_loss / total_points,
             "train_miou": train_miou,
             "val_miou": val_miou,
+            "train_peak_memory_mb": train_peak_memory_mb,
         })
         print(f"Epoch {epoch:03d} | loss {history[-1]['train_loss']:.4f} | "
               f"train mIoU {train_miou:.4f} | val mIoU {val_miou:.4f}")
@@ -225,6 +284,32 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
         else:
             epochs_without_improvement += 1
 
+        # Save every completed epoch, not only at the end of a Slurm allocation.
+        # Replace files atomically so an interrupted write leaves the old copy.
+        if checkpoint_path is not None:
+            payload = {
+                **conditions, "epoch": epoch, "best_epoch": best_epoch,
+                "best_val_miou": best_miou, "history": history,
+                "elapsed_s": previous_time_s + time.perf_counter() - start_time,
+                "train_peak_memory_mb": train_peak_memory_mb,
+            }
+            best_payload = {**payload, "model_state_dict": best_state}
+            _save_training_checkpoint(checkpoint_path, best_payload)
+            last_payload = {
+                **payload, "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_model_state_dict": best_state,
+                "epochs_without_improvement": epochs_without_improvement,
+                "shuffle_rng_state": rng.bit_generator.state,
+            }
+            _save_training_checkpoint(checkpoint_path.with_name("last.pth"), last_payload)
+        if history_path is not None:
+            path = Path(history_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(json.dumps(history, indent=2) + "\n")
+            temporary.replace(path)
+
         if patience is not None and epochs_without_improvement >= patience:
             print(f"Early stopping at epoch {epoch}")
             break
@@ -234,26 +319,20 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
     model.trained_voxel_size_m = float(voxel_size)
     model.best_epoch = best_epoch
     model.best_val_miou = best_miou
+    model.training_time_s = previous_time_s + time.perf_counter() - start_time
+    model.train_peak_memory_mb = train_peak_memory_mb
     print(f"Restored epoch {best_epoch}, validation mIoU {best_miou:.4f}")
 
-    if checkpoint_path is not None:
-        checkpoint_path = Path(checkpoint_path)
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "model_state_dict": best_state,
-            "best_epoch": best_epoch,
-            "best_val_miou": best_miou,
-            "voxel_size_m": float(voxel_size),
-            "num_classes": num_classes,
-            "in_channels": model.in_channels,
-            "channels": model.channels,
-            "from_pretrained": bool(getattr(model, "from_pretrained", False)),
-            "seed": seed,
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "history": history,
-        }, checkpoint_path)
     return model, history
+
+
+def _save_training_checkpoint(path, payload):
+    """Write a complete checkpoint before replacing the previous copy."""
+    import torch
+
+    temporary = path.with_name(path.name + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def evaluate(model, loader, voxel_size: float) -> SegmentationResult:

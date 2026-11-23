@@ -9,6 +9,9 @@ results/
 *.bag
 *.pth
 *.ckpt
+*.pth.tmp
+slurm-*.out
+slurm-*.err
 outputs/
 wandb/
 
