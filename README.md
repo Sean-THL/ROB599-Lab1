@@ -449,9 +449,34 @@ depth (stride 4, 5 cm voxel downsampling), and saves `splats.npz` plus
 `manifest.json` under a new `results/c1_<timestamp>/` directory. The command
 prints the exact saved path. Use `--out /path/to/new/folder` to choose a location
 or `--iterations 30000` for a longer fitting budget after the first fit works.
-An explicit output folder must not already exist. This entry point performs
-fitting only; it does not yet compute held-out rendering metrics or C2/C3.
+An explicit output folder must not already exist. Add `--evaluate --geometry`
+to compute C1 held-out scores and C2/C3 outputs after fitting.
 Do not paste a Python heredoc to run this command.
+
+To evaluate the already saved short fit without retraining, run:
+
+```bash
+python -u -m lab1.splatting \
+  --data ~/ROB599/data/scannet_scene0000_00 \
+  --load results/c1_20261123_224210_278848/splats.npz \
+  --evaluate --geometry
+```
+
+This creates a new `results/c_evaluation_<timestamp>/` directory. In `rendering/`,
+`metrics.json` contains mean PSNR (higher is better), SSIM (higher), and LPIPS
+(lower) over all 12 held-out views. `per_view_metrics.csv` records each view;
+`comparisons/` contains real/rendered image pairs. Images are scored as clipped
+float RGB before PNG quantization, using every pixel without an opacity mask.
+SSIM uses an 11-pixel Gaussian window, sigma 1.5 and population covariance.
+LPIPS uses AlexNet v0.1 with RGB inputs normalized to [-1, 1]; its first run may
+download pretrained metric-network weights. These weights are only for scoring.
+
+In `geometry/`, look for `surface_points.ply`, `surface_vs_gt.png`, and
+`metrics.json` for C2/C3. `gt_samples.npz` and `distances.npz` retain the samples
+and directional errors. The sensor-to-GT median distance is an alignment
+diagnostic, separate from the fitted model's reconstruction scores. Check the
+image pairs and geometry overlay before trusting the numbers. A 100-step fit
+is a preliminary result; evaluate it before choosing a longer fitting budget.
 
 `lab1.splatting.fit_splats` now connects Gaussian initialization to the
 `gsplat==1.5.3` rasterizer pinned in `environment.yml`. The API follows the
@@ -480,10 +505,9 @@ includes initialization, image transfers, optimization and any first-use kernel
 compilation. Peak GPU memory is PyTorch's maximum allocated memory, including
 all live tensors on the device. The returned `SplatModel` contains NumPy arrays
 with physical scales, opacity in [0, 1], and scalar-last unit quaternions.
-Held-out rendering, PSNR/SSIM/LPIPS evaluation, and the Part C driver connection
-still need to be implemented separately; the direct CLI saves fitted parameters.
-No fitting or tests were
-run when this integration was written.
+The direct CLI supports held-out PSNR/SSIM/LPIPS and geometry evaluation. The
+separate Part C driver connection remains unfinished. No fitting, evaluation,
+or tests were run when the evaluation integration was written.
 
 ## C2 and C3 geometry baseline
 
@@ -520,8 +544,10 @@ the metric raises rather than inventing a score. Keep and reuse the same GT
 samples, sampling seed/count, and threshold for D3. Raw directional distances
 are available as `geometry.dist_pred_to_gt` and `geometry.dist_gt_to_pred` for
 visualizing errors. C3's PSNR-versus-geometry discussion must use measured C1
-and C3 results. Rendering evaluation, report visuals and the Part C runner
-connection remain separate work. These functions have not been tested or run.
+and C3 results. The direct CLI saves rendering comparisons and a geometry
+overview; interpretation for the report and the separate Part C runner
+connection remain to be completed. These evaluation functions have not been
+tested or run.
 
 ## The contract tests
 

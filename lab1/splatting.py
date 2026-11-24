@@ -378,9 +378,202 @@ def evaluate_geometry(surface_points: np.ndarray, gt_mesh_points: np.ndarray,
     return accuracy_completeness(surface_points, gt_mesh_points, threshold=threshold)
 
 
+def load_splats(path) -> SplatModel:
+    """Read parameters saved by the fitting command; never load pickled objects."""
+    with np.load(path, allow_pickle=False) as saved:
+        model = SplatModel(
+            means=saved["means"], scales=saved["scales"],
+            rotations=saved["rotations"], opacities=saved["opacities"],
+            sh_coeffs=saved["sh_coeffs"],
+            fit_time_s=float(saved["fit_time_s"]),
+            peak_gpu_mb=float(saved["peak_gpu_mb"]),
+        )
+    model.validate()
+    return model
+
+
+def evaluate_rendering(model: SplatModel, scene, out_dir):
+    """C1: render ONLY held-out cameras and average full-image RGB metrics.
+
+    Scores use clipped [0, 1] float images before PNG quantization. SSIM uses
+    an 11-pixel Gaussian window (sigma=1.5), population covariance, data_range=1.
+    LPIPS uses AlexNet, metric version 0.1, with NCHW RGB normalized to [-1, 1].
+    The first LPIPS invocation may download pretrained metric-network weights.
+    """
+    import csv
+    from importlib.metadata import version
+    from pathlib import Path
+    import torch
+    import lpips
+    from PIL import Image, ImageDraw
+    from gsplat import rasterization
+    from skimage.metrics import structural_similarity
+    from rob498.io3d import write_json
+    from rob498.se3 import inverse
+
+    model.validate()
+    if not scene.test or set(scene.train) & set(scene.test):
+        raise ValueError("Need nonempty held-out views disjoint from training views")
+    if min(scene.width, scene.height) < 11:
+        raise ValueError("Images must be at least 11 pixels per axis for this SSIM setup")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Held-out Gaussian rendering requires a CUDA GPU")
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=False)
+    for folder in ("rendered", "reference", "comparisons"):
+        (out / folder).mkdir()
+
+    # Saved SplatModel uses physical scales and xyzw; gsplat wants wxyz.
+    means = torch.tensor(model.means, dtype=torch.float32, device="cuda")
+    scales = torch.tensor(model.scales, dtype=torch.float32, device="cuda")
+    quats = torch.tensor(model.rotations[:, [3, 0, 1, 2]], dtype=torch.float32, device="cuda")
+    opacities = torch.tensor(model.opacities, dtype=torch.float32, device="cuda")
+    colors = torch.tensor(model.sh_coeffs, dtype=torch.float32, device="cuda")
+    K = torch.tensor(scene.K, dtype=torch.float32, device="cuda").unsqueeze(0)
+    sh_degree = int(round(np.sqrt(model.sh_coeffs.shape[1]))) - 1
+    if (sh_degree + 1) ** 2 != model.sh_coeffs.shape[1]:
+        raise ValueError("SH coefficient count must be a square: 1, 4, 9, ...")
+    perceptual = lpips.LPIPS(net="alex", version="0.1").cuda().eval()
+    rows = []
+
+    with torch.no_grad():
+        for name in scene.test:
+            reference = scene.image(name)
+            if reference.shape != (scene.height, scene.width, 3):
+                raise ValueError(f"{name}: image dimensions disagree with cameras.json")
+            viewmat = torch.tensor(inverse(scene.pose(name)), dtype=torch.float32,
+                                   device="cuda").unsqueeze(0)
+            rendered, alpha, info = rasterization(
+                means=means, quats=quats, scales=scales, opacities=opacities,
+                colors=colors, viewmats=viewmat, Ks=K,
+                width=scene.width, height=scene.height, sh_degree=sh_degree,
+                backgrounds=None, render_mode="RGB",
+            )
+            prediction_tensor = rendered[0].clamp(0, 1)
+            prediction = prediction_tensor.cpu().numpy()
+            target_tensor = torch.tensor(reference, dtype=torch.float32, device="cuda")
+            prediction_nchw = prediction_tensor.permute(2, 0, 1).unsqueeze(0)
+            target_nchw = target_tensor.permute(2, 0, 1).unsqueeze(0)
+            row = {
+                "view": name,
+                "psnr_db": psnr(prediction, reference),
+                "ssim": float(structural_similarity(
+                    reference, prediction, channel_axis=-1, data_range=1.0,
+                    gaussian_weights=True, sigma=1.5, use_sample_covariance=False,
+                )),
+                "lpips": float(perceptual(prediction_nchw * 2 - 1, target_nchw * 2 - 1).item()),
+                "mean_opacity": float(alpha.mean().item()),
+            }
+            rows.append(row)
+            print(f"{name} | PSNR {row['psnr_db']:.2f} dB | "
+                  f"SSIM {row['ssim']:.4f} | LPIPS {row['lpips']:.4f}", flush=True)
+
+            # Save the exact same view side by side, without a display server.
+            reference_image = Image.fromarray(np.rint(reference * 255).astype(np.uint8))
+            prediction_image = Image.fromarray(np.rint(prediction * 255).astype(np.uint8))
+            reference_image.save(out / "reference" / f"{name}.png")
+            prediction_image.save(out / "rendered" / f"{name}.png")
+            pair = Image.new("RGB", (2 * scene.width, scene.height + 28), "white")
+            pair.paste(reference_image, (0, 28))
+            pair.paste(prediction_image, (scene.width, 28))
+            draw = ImageDraw.Draw(pair)
+            draw.text((8, 7), "Real held-out image", fill="black")
+            draw.text((scene.width + 8, 7), "Gaussian rendering", fill="black")
+            pair.save(out / "comparisons" / f"{name}.png")
+            del rendered, alpha, info, prediction_tensor, target_tensor
+            del prediction_nchw, target_nchw
+
+    with (out / "per_view_metrics.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = {
+        **model.summary(),
+        "psnr_mean_db": float(np.mean([row["psnr_db"] for row in rows])),
+        "ssim_mean": float(np.mean([row["ssim"] for row in rows])),
+        "lpips_mean": float(np.mean([row["lpips"] for row in rows])),
+        "held_out_views": scene.test, "n_held_out_views": len(rows),
+        "resolution": [scene.width, scene.height], "sh_degree": sh_degree,
+        "evaluation_scope": "all RGB pixels; floats clipped to [0,1]; no opacity mask",
+        "aggregation": "arithmetic mean of per-view metrics",
+        "ssim_settings": "Gaussian window 11, sigma 1.5, population covariance, data_range 1",
+        "lpips_settings": "AlexNet, version 0.1, RGB NCHW normalized to [-1,1]",
+        "gsplat_version": version("gsplat"), "lpips_package_version": version("lpips"),
+        "skimage_version": version("scikit-image"),
+    }
+    write_json(out / "metrics.json", summary)
+    return summary
+
+
+def save_geometry_results(model: SplatModel, scene, out_dir, *, threshold=0.05,
+                          n_gt_points=200000, seed=42, opacity_threshold=0.1,
+                          max_scale_m=0.5, k_neighbors=8, max_neighbor_dist_m=0.3):
+    """C2/C3: save extracted points, GT samples, errors, metrics and an overview."""
+    from pathlib import Path
+    from scipy.spatial import cKDTree
+    from rob498.io3d import write_json, write_ply_points
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=False)
+    filters = {
+        "opacity_threshold": opacity_threshold, "max_scale_m": max_scale_m,
+        "k_neighbors": k_neighbors, "max_neighbor_dist_m": max_neighbor_dist_m,
+    }
+    surface = extract_surface(model, **filters)
+    write_ply_points(out / "surface_points.ply", surface)
+    gt = scene.gt_points(n=n_gt_points, seed=seed)
+    np.savez_compressed(out / "gt_samples.npz", points=gt, seed=seed)
+    write_ply_points(out / "gt_points.ply", gt)
+    summary = {
+        "method": "filtered Gaussian centres; shape and orientation not reconstructed",
+        "filters": filters, "gaussians_before": model.n_gaussians,
+        "points_after": len(surface), "gt_sample_count": n_gt_points,
+        "gt_sampling_seed": seed, "threshold_m": threshold,
+    }
+    write_json(out / "extraction.json", summary)
+    if not len(surface):
+        raise ValueError("All Gaussians were filtered out. Empty extraction was saved; do not invent geometry scores")
+    geometry = evaluate_geometry(surface, gt, threshold=threshold)
+    summary.update(geometry.summary())
+    np.savez_compressed(
+        out / "distances.npz", dist_pred_to_gt=geometry.dist_pred_to_gt,
+        dist_gt_to_pred=geometry.dist_gt_to_pred,
+    )
+
+    # An alignment diagnostic from TRAINING sensor depth, not mesh-rendered depth.
+    sensor_points, _ = scene.fused_points(names=scene.train, stride=4, voxel=0.05)
+    if len(sensor_points):
+        distances, _ = cKDTree(gt).query(sensor_points)
+        summary["training_sensor_to_gt_median_m"] = float(np.median(distances))
+    write_json(out / "metrics.json", summary)
+
+    # Compare geometry in equal-scale orthographic projections, no GUI needed.
+    rng = np.random.default_rng(seed)
+    visible_gt = gt[rng.choice(len(gt), min(len(gt), 10000), replace=False)]
+    visible_surface = surface[rng.choice(len(surface), min(len(surface), 10000), replace=False)]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for axis, (a, b) in zip(axes, ((0, 1), (0, 2), (1, 2))):
+        axis.scatter(visible_gt[:, a], visible_gt[:, b], s=1, c="gray", alpha=0.3,
+                     label="GT mesh samples", rasterized=True)
+        axis.scatter(visible_surface[:, a], visible_surface[:, b], s=2, c="red", alpha=0.5,
+                     label="Extracted centres", rasterized=True)
+        axis.set_xlabel("xyz"[a] + " (m)")
+        axis.set_ylabel("xyz"[b] + " (m)")
+        axis.set_aspect("equal", adjustable="box")
+        axis.legend(markerscale=3)
+    fig.tight_layout()
+    fig.savefig(out / "surface_vs_gt.png", dpi=150)
+    plt.close(fig)
+    return summary
+
+
 def main():
-    """Load a prepared scene and run C1 fitting without a pasted Python block."""
+    """Fit or evaluate a saved model without a pasted Python block."""
     import argparse
+    import json
     from datetime import datetime
     from importlib.metadata import version
     from pathlib import Path
@@ -397,6 +590,17 @@ def main():
                         help="Prepared data root containing eval_scene/cameras.json")
     parser.add_argument("--out", type=Path,
                         help="New output folder; default: results/c1_<timestamp>")
+    parser.add_argument("--load", type=Path, help="Saved splats.npz; skip fitting")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Render held-out views, save image pairs and PSNR/SSIM/LPIPS")
+    parser.add_argument("--geometry", action="store_true",
+                        help="Run C2/C3, save extracted geometry, metrics and GT comparison")
+    parser.add_argument("--recon-threshold", type=float, default=0.05)
+    parser.add_argument("--gt-points", type=int, default=200000)
+    parser.add_argument("--opacity-threshold", type=float, default=0.1)
+    parser.add_argument("--max-scale-m", type=float, default=0.5)
+    parser.add_argument("--k-neighbors", type=int, default=8)
+    parser.add_argument("--max-neighbor-dist-m", type=float, default=0.3)
     parser.add_argument("--iterations", type=int, default=100,
                         help="100 for a short first fit; choose a larger budget for final fitting")
     parser.add_argument("--max-gaussians", type=int, default=20000)
@@ -414,6 +618,15 @@ def main():
         parser.error("voxel-size must be positive and finite")
     if not np.isfinite(args.lr) or args.lr <= 0 or args.log_every < 0:
         parser.error("Need positive finite lr and nonnegative log-every")
+    if args.load is not None and not (args.evaluate or args.geometry):
+        parser.error("With --load, select --evaluate and/or --geometry")
+    if args.gt_points < 1 or args.k_neighbors < 1:
+        parser.error("gt-points and k-neighbors must be positive")
+    if not np.isfinite(args.opacity_threshold) or not 0 <= args.opacity_threshold <= 1:
+        parser.error("opacity-threshold must be in [0, 1]")
+    for value in (args.recon_threshold, args.max_scale_m, args.max_neighbor_dist_m):
+        if not np.isfinite(value) or value <= 0:
+            parser.error("Geometry distance/scale thresholds must be positive and finite")
 
     # 1. Load the scene. Existing exported data is reused, not regenerated.
     scene = load_eval_scene(args.data)
@@ -422,52 +635,87 @@ def main():
     print(f"Scene: {args.data} | {len(scene.train)} train / {len(scene.test)} held-out views",
           flush=True)
 
-    # 2. Build initial Gaussians from TRAINING sensor depth, never the GT mesh.
-    points, colors = scene.fused_points(
-        names=scene.train, stride=args.stride, voxel=args.voxel_size
-    )
-    if len(points) < 2:
-        parser.error("Training depth produced fewer than two valid points")
-    if len(points) > args.max_gaussians:
-        indices = np.random.default_rng(args.seed).choice(
-            len(points), args.max_gaussians, replace=False
-        )
-        points, colors = points[indices], colors[indices]
-    print(f"Initial Gaussians: {len(points)}", flush=True)
-
     # 3. Record the exact inputs and settings alongside the fitted model.
-    out = args.out or Path("results") / datetime.now().strftime("c1_%Y%m%d_%H%M%S_%f")
+    prefix = "c_evaluation" if args.load else "c1"
+    out = args.out or Path("results") / (prefix + datetime.now().strftime("_%Y%m%d_%H%M%S_%f"))
     out.mkdir(parents=True, exist_ok=False)
-    manifest = RunManifest(run_name="c1_gaussian_fit", seed=args.seed)
+    manifest = RunManifest(run_name=prefix, seed=args.seed)
     manifest.add_param("data_root", str(args.data.resolve()))
     manifest.add_param("training_views", scene.train)
     manifest.add_param("held_out_views", scene.test)
     manifest.add_param("resolution", [scene.width, scene.height])
-    manifest.add_param("iterations", args.iterations)
-    manifest.add_param("initial_gaussian_count", len(points))
-    manifest.add_param("initialization_stride", args.stride)
-    manifest.add_param("initialization_voxel_size_m", args.voxel_size)
-    manifest.add_param("lr", args.lr)
-    manifest.add_param("sh_degree", 0)
-    manifest.add_param("gaussian_count_strategy", "fixed; no splitting or pruning")
     manifest.add_param("gsplat_version", version("gsplat"))
-    manifest.add_param("loss", "L1 RGB on training views; black background")
-    manifest.save(out)
+    if args.load is not None:
+        model = load_splats(args.load)
+        manifest.add_param("source_model", str(args.load.resolve()))
+        source_manifest = args.load.parent / "manifest.json"
+        if source_manifest.exists():
+            source = json.loads(source_manifest.read_text())
+            recorded = source["params"]
+            if (recorded.get("training_views") != scene.train
+                    or recorded.get("held_out_views") != scene.test
+                    or recorded.get("resolution") != [scene.width, scene.height]
+                    or recorded.get("data_root") != str(args.data.resolve())):
+                parser.error("Saved model scene/split/resolution differs from the requested scene")
+            manifest.add_param("source_fit_manifest", source)
+        else:
+            print("No source manifest: scene/split provenance must be checked manually.", flush=True)
+        print(f"Loaded {model.n_gaussians} Gaussians; no fitting will run", flush=True)
+    else:
+        # 2. Build initial Gaussians from TRAINING sensor depth, never the GT mesh.
+        points, colors = scene.fused_points(
+            names=scene.train, stride=args.stride, voxel=args.voxel_size
+        )
+        if len(points) < 2:
+            parser.error("Training depth produced fewer than two valid points")
+        if len(points) > args.max_gaussians:
+            indices = np.random.default_rng(args.seed).choice(
+                len(points), args.max_gaussians, replace=False
+            )
+            points, colors = points[indices], colors[indices]
+        print(f"Initial Gaussians: {len(points)}", flush=True)
+        for key, value in {
+            "iterations": args.iterations, "initial_gaussian_count": len(points),
+            "initialization_stride": args.stride, "initialization_voxel_size_m": args.voxel_size,
+            "lr": args.lr, "sh_degree": 0,
+            "gaussian_count_strategy": "fixed; no splitting or pruning",
+            "loss": "L1 RGB on training views; black background",
+        }.items():
+            manifest.add_param(key, value)
+        manifest.save(out)
 
-    # 4. Fit, then save NumPy parameters in the course's SplatModel conventions.
-    model = fit_splats(
-        scene.images(scene.train), scene.poses(scene.train), scene.K,
-        initial_points=points,
-        initial_colors=colors.astype(np.float32) / 255.0,
-        n_iterations=args.iterations, lr=args.lr, seed=args.seed,
-        log_every=args.log_every,
-    )
-    np.savez_compressed(out / "splats.npz", **vars(model))
+        # 4. Fit, then save NumPy parameters in the course's SplatModel conventions.
+        model = fit_splats(
+            scene.images(scene.train), scene.poses(scene.train), scene.K,
+            initial_points=points,
+            initial_colors=colors.astype(np.float32) / 255.0,
+            n_iterations=args.iterations, lr=args.lr, seed=args.seed,
+            log_every=args.log_every,
+        )
+        np.savez_compressed(out / "splats.npz", **vars(model))
     manifest.add_result("fit", model.summary())
     manifest.save(out)
     print(model.summary(), flush=True)
-    print(f"Saved fitted splats and conditions to {out.resolve()}", flush=True)
-    print("Held-out rendering metrics are still required to complete C1.", flush=True)
+
+    if args.evaluate:
+        rendering = evaluate_rendering(model, scene, out / "rendering")
+        manifest.add_result("c1_rendering", rendering)
+        manifest.save(out)
+        print(f"Held-out means: PSNR={rendering['psnr_mean_db']:.2f} dB, "
+              f"SSIM={rendering['ssim_mean']:.4f}, LPIPS={rendering['lpips_mean']:.4f}", flush=True)
+    if args.geometry:
+        geometry = save_geometry_results(
+            model, scene, out / "geometry", threshold=args.recon_threshold,
+            n_gt_points=args.gt_points, seed=args.seed,
+            opacity_threshold=args.opacity_threshold, max_scale_m=args.max_scale_m,
+            k_neighbors=args.k_neighbors, max_neighbor_dist_m=args.max_neighbor_dist_m,
+        )
+        manifest.add_result("c2_c3_geometry", geometry)
+        manifest.save(out)
+        print(f"Geometry: {geometry}", flush=True)
+    print(f"Saved outputs and conditions to {out.resolve()}", flush=True)
+    if not args.evaluate:
+        print("Held-out rendering metrics are still required to complete C1.", flush=True)
 
 
 if __name__ == "__main__":
