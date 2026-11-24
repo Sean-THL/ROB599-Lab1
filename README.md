@@ -369,7 +369,89 @@ Full scenes are used without cropping; if a scene exceeds GPU memory, add an
 explicit training crop strategy rather than silently dropping evaluation points.
 Part B in `run_lab1.py` is wired; the Great Lakes batch workflow above is preferred.
 
+## Prepare one ScanNet evaluation scene for C--E
+
+Use the instructor-assigned evaluation scene if one is specified. `scene0000_00`
+below is a development example, not an asserted course-required scene. Select
+one scene once and reuse its prepared images, split and GT mesh across C, D and
+E. The Part B segmentation NPZ files alone cannot supply the required RGB-D
+frames and camera calibration.
+
+On the RTX 4090 server, transfer only the recording, high-quality mesh and
+optional scene metadata from Great Lakes:
+
+```bash
+mkdir -p ~/ROB599/raw/scene0000_00
+rsync -avh --info=progress2 \
+  -e 'ssh -o PubkeyAuthentication=no' \
+  --include='scene0000_00.sens' \
+  --include='scene0000_00_vh_clean.ply' \
+  --include='scene0000_00.txt' --exclude='*' \
+  szlin@greatlakes.arc-ts.umich.edu:/scratch/rob498_rob598s002f26_class_root/rob498_rob598s002f26_class/shared_data/scannet_dataset/dataset/scans/scene0000_00/ \
+  ~/ROB599/raw/scene0000_00/
+```
+
+Authenticate with your U-M credentials and MFA, not a GitHub token. This copies
+one scene, not the full dataset. Its `.sens` recording is several GB; the 27 MB
+segmentation subset does not include that recording.
+
+After getting `scripts/prepare_scannet_scene.py` onto the server, run on CPU:
+
+```bash
+cd ~/ROB599/ROB599-Lab1
+conda activate rob498
+python scripts/prepare_scannet_scene.py \
+  --scene-dir ~/ROB599/raw/scene0000_00 \
+  --out ~/ROB599/data/scannet_scene0000_00 \
+  --max-frames 60 --test-every 5 --width 640 --height 480
+```
+
+The new root contains `eval_scene/images/`, `eval_scene/depth/`,
+`eval_scene/cameras.json`, `eval_scene/mesh.ply`, plus
+`scene_preparation.json` recording the selection and calibration. With at least
+60 valid frames, there are 48 training and 12 held-out views. Invalid poses
+are skipped before uniform temporal selection. No model fitting is performed.
+Existing `eval_scene/` directories are not overwritten.
+
+The exporter reads ScanNet version-4 binary RGB-D recordings using the
+[official format](https://github.com/ScanNet/ScanNet/tree/master/SensReader).
+It streams compressed frame offsets and decompresses selected frames only.
+It resizes RGB with adjusted intrinsics, projects measured sensor depth onto
+that RGB grid with nearest-depth occlusion handling, and leaves unobserved
+pixels zero. It exports OpenCV RGB-camera-to-world poses, keeping the original
+mesh/world frame. It does not independently apply the scene's axis-alignment
+matrix. Nonidentity color calibration extrinsics are rejected rather than
+silently guessing a pose convention. Alignment code follows the depth-to-color
+transform used by the official `saveToPointCloud` implementation.
+
+Load with `load_eval_scene("/home/tk/ROB599/data/scannet_scene0000_00")`.
+For C1 initialization, call `scene.fused_points(names=scene.train, ...)` and
+convert returned uint8 colors to [0, 1]. Use the copied mesh only for evaluation.
+Keep held-out views out of fitting and VGGT input for comparable held-out image
+evaluation. Do not send poses or intrinsics into VGGT's forward pass.
+Preparation code has not been executed or tested; inspect RGB/depth registration
+and a fused training point cloud against the mesh before interpreting results.
+
 ## C1 fitting baseline
+
+`splatting.py` now includes the scene-loading, initialization and saving entry
+point. From the repository root on the RTX 4090 server, run:
+
+```bash
+conda activate rob498
+python -u -m lab1.splatting \
+  --data ~/ROB599/data/scannet_scene0000_00 \
+  --iterations 100
+```
+
+This reuses the prepared scene, initializes up to 20,000 Gaussians from training
+depth (stride 4, 5 cm voxel downsampling), and saves `splats.npz` plus
+`manifest.json` under a new `results/c1_<timestamp>/` directory. The command
+prints the exact saved path. Use `--out /path/to/new/folder` to choose a location
+or `--iterations 30000` for a longer fitting budget after the first fit works.
+An explicit output folder must not already exist. This entry point performs
+fitting only; it does not yet compute held-out rendering metrics or C2/C3.
+Do not paste a Python heredoc to run this command.
 
 `lab1.splatting.fit_splats` now connects Gaussian initialization to the
 `gsplat==1.5.3` rasterizer pinned in `environment.yml`. The API follows the
@@ -398,9 +480,48 @@ includes initialization, image transfers, optimization and any first-use kernel
 compilation. Peak GPU memory is PyTorch's maximum allocated memory, including
 all live tensors on the device. The returned `SplatModel` contains NumPy arrays
 with physical scales, opacity in [0, 1], and scalar-last unit quaternions.
-Held-out rendering, PSNR/SSIM/LPIPS evaluation, saving, and the Part C runner
-connection still need to be implemented separately. No fitting or tests were
+Held-out rendering, PSNR/SSIM/LPIPS evaluation, and the Part C driver connection
+still need to be implemented separately; the direct CLI saves fitted parameters.
+No fitting or tests were
 run when this integration was written.
+
+## C2 and C3 geometry baseline
+
+`extract_surface()` uses the provided floater filter and returns retained
+Gaussian centres as a point cloud. Defaults: opacity > 0.1, maximum axis scale
+< 0.5 m, and, when more than eight candidates remain, mean distance to the eight
+nearest other candidates <= 0.3 m. It does not create a triangle mesh or recover
+the ellipsoids' extents. Thin Gaussians are not rejected merely for being
+anisotropic, but a large longest axis triggers removal regardless of orientation.
+Explain this approximation and show the extraction against the GT mesh for C2.
+
+`evaluate_geometry()` calls the provided symmetric point-cloud metric, returning
+a `ReconResult`. Accuracy is predicted-point-to-GT distance; completeness is
+GT-point-to-prediction distance. These errors are in metres and lower is better.
+Precision, recall and F-score use the supplied distance threshold (default 0.05 m)
+and are fractions, with higher values better. Both clouds must share a frame
+and scale. Sample the ground-truth mesh by area rather than using its vertices.
+
+```python
+from lab1.splatting import extract_surface, evaluate_geometry
+
+# model is the fitted SplatModel; scene is the prepared EvalScene.
+surface_points = extract_surface(
+    model, opacity_threshold=0.1, max_scale_m=0.5,
+    k_neighbors=8, max_neighbor_dist_m=0.3,
+)
+gt_points = scene.gt_points(n=200_000, seed=42)
+geometry = evaluate_geometry(surface_points, gt_points, threshold=0.05)
+print(geometry.summary())
+```
+
+If every Gaussian is filtered out, extraction returns an empty point cloud;
+the metric raises rather than inventing a score. Keep and reuse the same GT
+samples, sampling seed/count, and threshold for D3. Raw directional distances
+are available as `geometry.dist_pred_to_gt` and `geometry.dist_gt_to_pred` for
+visualizing errors. C3's PSNR-versus-geometry discussion must use measured C1
+and C3 results. Rendering evaluation, report visuals and the Part C runner
+connection remain separate work. These functions have not been tested or run.
 
 ## The contract tests
 
@@ -501,6 +622,10 @@ AI assistance was used to integrate the C1 Gaussian initialization, rendering,
 optimization loop, and export to the course's `SplatModel` conventions.
 AI assistance was also used for the ScanNet20 preparation script, Part B runner,
 resumable checkpoints, Great Lakes batch script, and report-artifact generation.
+AI assistance was used for the C2 filtered-centre extraction baseline, C3 wrapper
+around the provided geometry metric, and their usage documentation.
+AI assistance was used for the single-scene ScanNet RGB-D exporter for C--E.
+AI assistance was used for the direct fitting CLI in `lab1/splatting.py`.
 
 Permitted, per the course policy. You are responsible for everything you submit:
 if you cannot explain a line of your code in office hours, it does not count as

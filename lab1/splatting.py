@@ -8,6 +8,9 @@ against ground truth AT THE LAB'S FIXED THRESHOLD (``--recon-threshold``, the sa
 one D3 uses for the feed-forward reconstruction) so the numbers are comparable, then comment on the relationship between your PSNR and your
 geometric accuracy. "They are not the same ordering, and the gap is the
 finding."
+
+Run a short C1 fit from the repository root:
+    python -u -m lab1.splatting --data /path/to/prepared_scene --iterations 100
 """
 from __future__ import annotations
 
@@ -250,7 +253,6 @@ def fit_splats(images, poses, intrinsics, n_iterations: int = 30_000, **kwargs) 
     )
     K = torch.tensor(intrinsics, dtype=torch.float32, device=device)
     height, width = images.shape[1:3]
-    background = torch.zeros((1, 3), device=device)
 
     # 7. One optimizer updates all five sets of Gaussian parameters.
     # A shared learning rate is a simple starting point, not a tuned 3DGS recipe.
@@ -276,7 +278,8 @@ def fit_splats(images, poses, intrinsics, n_iterations: int = 30_000, **kwargs) 
             width=width,
             height=height,
             sh_degree=0,
-            backgrounds=background,
+            # None uses black and avoids the packed backend's background-shape check.
+            backgrounds=None,
             render_mode="RGB",
         )
         prediction = rendered[0]  # Remove the camera dimension: (H, W, 3).
@@ -324,8 +327,26 @@ def extract_surface(model: SplatModel, method: str = "opacity_threshold", **kwar
     stretched along a viewing ray, and distinguishing them is the whole problem.
     Whatever rule you adopt, state it as a predicate on the scales and show what
     it removes.
+
+    Simple baseline: return the filtered Gaussian centres as an (M, 3) point
+    cloud. This is an approximate geometry estimate, not a triangle mesh or
+    a Gaussian isosurface. Rotation and spatial extent are not reconstructed.
+
+    kwargs are passed to the provided filter_floaters(): opacity_threshold=0.1,
+    max_scale_m=0.5, k_neighbors=8, max_neighbor_dist_m=0.3. A Gaussian is
+    rejected if ANY axis scale reaches max_scale_m, regardless of orientation;
+    anisotropy alone is not rejected, so thin real structures can survive.
     """
-    raise NotImplementedError("Lab 1 C2: extract a surface from the splat model")
+    if method != "opacity_threshold":
+        raise ValueError("Only method='opacity_threshold' is implemented")
+
+    # The provided filter validates the model and removes low-opacity,
+    # oversized and isolated Gaussians using the thresholds above.
+    keep = filter_floaters(model, **kwargs)
+
+    # One representative point per retained Gaussian. Shape: (M, 3).
+    # Centres ignore the ellipsoid's shape; document this approximation in C2.
+    return np.asarray(model.means)[keep].copy()
 
 
 def evaluate_geometry(surface_points: np.ndarray, gt_mesh_points: np.ndarray,
@@ -342,5 +363,112 @@ def evaluate_geometry(surface_points: np.ndarray, gt_mesh_points: np.ndarray,
     the best accuracy, say why. The mechanism is usually that view synthesis is
     rewarded for reproducing appearance from the training viewpoints and is
     indifferent to where the geometry actually sits along the ray.
+
+    Both point sets must be in the same world frame and in metres. Pass
+    area-weighted GT mesh samples, e.g. scene.gt_points(n=200_000, seed=42),
+    rather than raw mesh vertices. Reuse the same samples and threshold in D3.
     """
-    raise NotImplementedError("Lab 1 C3: evaluate the extracted geometry")
+    from rob498.metrics import accuracy_completeness
+
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError("threshold must be positive and finite, in metres")
+
+    # Keep the provided metric definitions: prediction -> GT measures accuracy;
+    # GT -> prediction measures completeness. Do not swap the two inputs.
+    return accuracy_completeness(surface_points, gt_mesh_points, threshold=threshold)
+
+
+def main():
+    """Load a prepared scene and run C1 fitting without a pasted Python block."""
+    import argparse
+    from datetime import datetime
+    from importlib.metadata import version
+    from pathlib import Path
+    import sys
+
+    # Also support `python lab1/splatting.py ...` from the repository checkout.
+    if not __package__:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from lab1.dataset import load_eval_scene
+    from rob498.config import RunManifest
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, required=True,
+                        help="Prepared data root containing eval_scene/cameras.json")
+    parser.add_argument("--out", type=Path,
+                        help="New output folder; default: results/c1_<timestamp>")
+    parser.add_argument("--iterations", type=int, default=100,
+                        help="100 for a short first fit; choose a larger budget for final fitting")
+    parser.add_argument("--max-gaussians", type=int, default=20000)
+    parser.add_argument("--voxel-size", type=float, default=0.05,
+                        help="Training-depth cloud downsampling size in metres")
+    parser.add_argument("--stride", type=int, default=4,
+                        help="Pixel stride when back-projecting training depth")
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log-every", type=int, default=10)
+    args = parser.parse_args()
+    if args.iterations < 1 or args.max_gaussians < 2 or args.stride < 1:
+        parser.error("Need iterations >= 1, max-gaussians >= 2 and stride >= 1")
+    if not np.isfinite(args.voxel_size) or args.voxel_size <= 0:
+        parser.error("voxel-size must be positive and finite")
+    if not np.isfinite(args.lr) or args.lr <= 0 or args.log_every < 0:
+        parser.error("Need positive finite lr and nonnegative log-every")
+
+    # 1. Load the scene. Existing exported data is reused, not regenerated.
+    scene = load_eval_scene(args.data)
+    if not scene.train:
+        parser.error("The scene has no training views")
+    print(f"Scene: {args.data} | {len(scene.train)} train / {len(scene.test)} held-out views",
+          flush=True)
+
+    # 2. Build initial Gaussians from TRAINING sensor depth, never the GT mesh.
+    points, colors = scene.fused_points(
+        names=scene.train, stride=args.stride, voxel=args.voxel_size
+    )
+    if len(points) < 2:
+        parser.error("Training depth produced fewer than two valid points")
+    if len(points) > args.max_gaussians:
+        indices = np.random.default_rng(args.seed).choice(
+            len(points), args.max_gaussians, replace=False
+        )
+        points, colors = points[indices], colors[indices]
+    print(f"Initial Gaussians: {len(points)}", flush=True)
+
+    # 3. Record the exact inputs and settings alongside the fitted model.
+    out = args.out or Path("results") / datetime.now().strftime("c1_%Y%m%d_%H%M%S_%f")
+    out.mkdir(parents=True, exist_ok=False)
+    manifest = RunManifest(run_name="c1_gaussian_fit", seed=args.seed)
+    manifest.add_param("data_root", str(args.data.resolve()))
+    manifest.add_param("training_views", scene.train)
+    manifest.add_param("held_out_views", scene.test)
+    manifest.add_param("resolution", [scene.width, scene.height])
+    manifest.add_param("iterations", args.iterations)
+    manifest.add_param("initial_gaussian_count", len(points))
+    manifest.add_param("initialization_stride", args.stride)
+    manifest.add_param("initialization_voxel_size_m", args.voxel_size)
+    manifest.add_param("lr", args.lr)
+    manifest.add_param("sh_degree", 0)
+    manifest.add_param("gaussian_count_strategy", "fixed; no splitting or pruning")
+    manifest.add_param("gsplat_version", version("gsplat"))
+    manifest.add_param("loss", "L1 RGB on training views; black background")
+    manifest.save(out)
+
+    # 4. Fit, then save NumPy parameters in the course's SplatModel conventions.
+    model = fit_splats(
+        scene.images(scene.train), scene.poses(scene.train), scene.K,
+        initial_points=points,
+        initial_colors=colors.astype(np.float32) / 255.0,
+        n_iterations=args.iterations, lr=args.lr, seed=args.seed,
+        log_every=args.log_every,
+    )
+    np.savez_compressed(out / "splats.npz", **vars(model))
+    manifest.add_result("fit", model.summary())
+    manifest.save(out)
+    print(model.summary(), flush=True)
+    print(f"Saved fitted splats and conditions to {out.resolve()}", flush=True)
+    print("Held-out rendering metrics are still required to complete C1.", flush=True)
+
+
+if __name__ == "__main__":
+    main()
