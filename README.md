@@ -11,6 +11,32 @@ python scripts/check_env.py            # on a GPU node: python scripts/check_env
 pytest rob498/tests lab1/tests -v
 ```
 
+## Part B: measured 5 cm baseline
+
+On the prepared ScanNet20 subset (10 training scenes, 2 validation scenes;
+subset-selection seed 42), the compact sparse U-Net was trained from scratch
+on an NVIDIA RTX 4090 with training seed 42 and 5 cm voxels. Adam used a learning
+rate of 0.001 and weight decay of 0.0001, with a 50-epoch budget and patience 10.
+The best validation mIoU was **18.7303% at epoch 33**. Early stopping occurred at
+epoch 43, and the epoch-33 weights were restored.
+
+![Training loss and online training versus validation mIoU for the 5 cm run](report_assets/part_b_5cm_seed42/training_curves.png)
+
+[Per-class IoU table (CSV)](report_assets/part_b_5cm_seed42/per_class_iou.csv).
+IoUs are stored as fractions. The CSV's 17 defined class IoUs average to
+0.1873028221; 14 classes have ground-truth points in the validation subset.
+A blank IoU denotes absence from both predictions and ground truth. A zero IoU
+can also occur for a class absent from ground truth but predicted incorrectly.
+
+Training loss falls while online training mIoU rises to about 70%, but validation
+mIoU remains below 19%, consistent with overfitting and limited generalization.
+Training scores are collected during parameter updates; validation scores use
+fixed end-of-epoch weights and evaluation mode. These are subset validation
+results used for checkpoint selection, not independent test or full-benchmark
+results. The chart and CSV alone do not establish that the evaluation pipeline
+is free of errors. The epoch history and run metadata remain in the server's
+`~/ROB599/results/part_b_seed42/voxel_5cm/` directory.
+
 ## Great Lakes Part B: ready to submit
 
 This workflow uses the **ScanNet20 small-subset route discussed by the GSI**,
