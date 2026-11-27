@@ -796,3 +796,44 @@ Other datasets keep the previous RGB default. The main lab driver also exposes
 `--b-features xyz`. Rebuild models with the recorded feature mode when loading
 checkpoints elsewhere; it is an attribute, not a learned state-dictionary tensor.
 No preparation, training, or tests were run while writing this migration.
+
+## D2/D3: align VGGT and evaluate geometry
+
+The direct `lab1.feedforward` command now supports `--evaluate`:
+
+```bash
+python -u -m lab1.feedforward \
+  --data ~/ROB599/data/scannetpp_a08dda47a8 \
+  --n-views 4 --evaluate --recon-threshold 0.05 --seed 42
+```
+
+First finish the current segmentation job to avoid GPU memory competition.
+VGGT still receives only RGB. AFTER inference, the command pairs predicted
+camera-to-world poses with GT poses by the recorded frame IDs. The provided
+Umeyama alignment estimates one scale, rotation and translation from camera
+centres. Collinear paths are rejected; use more/different views in that case.
+The identical Sim(3) maps model points into world metres before calling the
+provided accuracy/completeness metric. No independent mesh alignment or ICP is
+used. `evaluate_geometry` requires this transform explicitly, returns the
+provided `ReconResult`, and does not modify the original model-frame points.
+
+The new result directory includes:
+
+- `alignment.json`, `sim3.npy`: D2 camera errors, recovered scale and transform.
+- `aligned_cameras.npz`: predicted world-frame poses, matching GT poses and IDs.
+- `points_world.ply`: D3 points in the mesh/world frame, in metres.
+- `geometry_metrics.json`: accuracy/completeness and precision/recall/F-score.
+- `gt_samples.npz`, `gt_points.ply`: area-weighted GT samples.
+- `geometry_distances.npz`: both directional nearest-neighbour errors.
+- `points_by_error.ply`: blue means zero error, red means at least 3 times the
+  chosen threshold (15 cm at the default). No points are discarded using errors.
+
+Default GT sampling is 200,000 points, seed 42. For the SAME scene's C3 samples,
+pass `--gt-samples /path/to/that_c_run/geometry/gt_samples.npz` to reuse the exact
+samples; keep C3/D3 thresholds equal. Never reuse the old ScanNet v2 samples
+when evaluating the new ScanNet++ scene. Reuse `sim3.npy` for Part E too.
+Scale comes from GT-assisted evaluation, not an independently metric VGGT
+prediction. Inspect colored error regions and describe failures for D3; scores
+alone do not complete that discussion. D1's four-count scaling experiment and
+the separate `run_lab1.py --part d` integration are still unfinished.
+Only syntax was checked for this change; no inference, evaluation or tests run.

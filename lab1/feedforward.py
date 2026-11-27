@@ -227,18 +227,46 @@ def evaluate_geometry(result: FeedForwardResult, gt_mesh_points: np.ndarray,
     A histogram alone does not answer this; you have to look at where the errors
     are.
     """
-    raise NotImplementedError("Lab 1 D3: evaluate the feed-forward geometry")
+    from rob498.metrics import accuracy_completeness
+
+    # A missing transform must not silently score arbitrary model units as metres.
+    if sim3 is None:
+        raise ValueError("Pass align_to_ground_truth(...)[\"sim3\"] before evaluating geometry")
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError("threshold must be positive and finite, in metres")
+    S = np.asarray(sim3, dtype=float)
+    if S.shape != (4, 4) or not np.isfinite(S).all():
+        raise ValueError("sim3 must be a finite (4, 4) matrix")
+    if not np.allclose(S[3], [0, 0, 0, 1]):
+        raise ValueError("sim3 must have last row [0, 0, 0, 1]")
+    scale = np.linalg.norm(S[:3, 0])
+    if scale <= 0 or not np.allclose(
+            S[:3, :3].T @ S[:3, :3], scale ** 2 * np.eye(3), rtol=1e-5, atol=1e-10):
+        raise ValueError("sim3 must contain one positive uniform scale and a rotation")
+    if np.linalg.det(S[:3, :3]) <= 0:
+        raise ValueError("sim3 rotation must not reflect the reconstruction")
+    for name, points in (("prediction", result.points), ("ground truth", gt_mesh_points)):
+        points = np.asarray(points)
+        if points.ndim != 2 or points.shape[1:] != (3,) or not len(points):
+            raise ValueError(f"{name} points must be a nonempty (N, 3) array")
+        if not np.isfinite(points).all():
+            raise ValueError(f"{name} points must be finite")
+
+    # Apply the SAME camera-derived Sim(3) to every predicted point, exactly once.
+    # Leave result.points in model coordinates so it can be reused safely.
+    aligned_points = apply_sim3(S, result.points)
+    return accuracy_completeness(aligned_points, gt_mesh_points, threshold=threshold)
 
 
 def main():
-    """Run D1 from prepared scene images; save predictions without GT alignment."""
+    """Run D1 and optionally D2/D3, using ground truth only after inference."""
     import argparse
     from datetime import datetime
     from pathlib import Path
     from importlib.metadata import version
     from lab1.dataset import load_eval_scene
     from rob498.config import RunManifest
-    from rob498.io3d import write_ply_points
+    from rob498.io3d import write_json, write_ply_points
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True,
@@ -248,12 +276,23 @@ def main():
     parser.add_argument("--confidence-threshold", type=float, default=0.0,
                         help="Keep depth confidence above this value; not a probability")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--evaluate", action="store_true",
+                        help="After inference: align predicted cameras and evaluate geometry")
+    parser.add_argument("--recon-threshold", type=float, default=0.05,
+                        help="Distance threshold in metres; use the same value as C3")
+    parser.add_argument("--gt-points", type=int, default=200000)
+    parser.add_argument("--gt-samples", type=Path,
+                        help="Reuse C3 geometry/gt_samples.npz for identical GT samples")
     args = parser.parse_args()
     scene = load_eval_scene(args.data)
     if not 1 <= args.n_views <= len(scene.train):
         parser.error(f"n-views must be between 1 and {len(scene.train)}")
     if not np.isfinite(args.confidence_threshold) or args.confidence_threshold < 0:
         parser.error("confidence-threshold must be finite and nonnegative")
+    if args.evaluate and args.n_views < 3:
+        parser.error("D2 alignment needs at least three views")
+    if args.gt_points < 1 or not np.isfinite(args.recon_threshold) or args.recon_threshold <= 0:
+        parser.error("Need positive gt-points and a positive finite recon-threshold")
 
     # Spread selected views across the TRAINING sequence. Never use held-out RGB.
     indices = np.linspace(0, len(scene.train) - 1, args.n_views, dtype=int)
@@ -281,8 +320,67 @@ def main():
     manifest.add_result("d1", result.summary())
     manifest.save(out)
     print(result.summary(), flush=True)
-    print(f"Saved D1 results to {out.resolve()}", flush=True)
-    print("Points are NOT metric-aligned: D2 Sim(3) alignment and D3 evaluation remain.", flush=True)
+    if args.evaluate:
+        # D2: pair predicted and GT cameras by frame ID, never by an assumed order.
+        # These GT poses are used ONLY for evaluation, never supplied to VGGT.
+        gt_poses = scene.poses(result.view_ids)
+        for label, poses in (("predicted", result.poses), ("ground-truth", gt_poses)):
+            if not np.isfinite(poses).all():
+                raise ValueError(f"Non-finite {label} poses")
+            centres = poses[:, :3, 3]
+            if np.linalg.matrix_rank(centres - centres.mean(axis=0), tol=1e-6) < 2:
+                raise ValueError(f"{label} camera centres are collinear; select more/different views")
+        alignment = align_to_ground_truth(result.poses, gt_poses)
+        S = alignment["sim3"]
+        if not np.isfinite(S).all() or alignment["scale_factor"] <= 0:
+            raise ValueError("Camera alignment did not produce a finite positive scale")
+        write_json(out / "alignment.json", alignment)
+        np.save(out / "sim3.npy", S)
+
+        # Scale/rotate/translate camera CENTRES; camera rotations get rotation only.
+        aligned_poses = result.poses.astype(float).copy()
+        aligned_poses[:, :3, :3] = (S[:3, :3] / alignment["scale_factor"]) @ result.poses[:, :3, :3]
+        aligned_poses[:, :3, 3] = apply_sim3(S, result.poses[:, :3, 3])
+        np.savez_compressed(out / "aligned_cameras.npz", poses=aligned_poses,
+                            gt_poses=gt_poses, view_ids=result.view_ids)
+
+        # D3: reuse C3 samples, or use its default area sampling count and seed.
+        if args.gt_samples:
+            with np.load(args.gt_samples, allow_pickle=False) as saved:
+                gt_points = saved["points"]
+            manifest.add_param("gt_sample_source", str(args.gt_samples.resolve()))
+        else:
+            gt_points = scene.gt_points(n=args.gt_points, seed=args.seed)
+            manifest.add_param("gt_sampling_seed", args.seed)
+        geometry = evaluate_geometry(result, gt_points, args.recon_threshold, sim3=S)
+        world_points = apply_sim3(S, result.points)
+        write_ply_points(out / "points_world.ply", world_points)
+        write_ply_points(out / "gt_points.ply", gt_points)
+        np.savez_compressed(out / "gt_samples.npz", points=gt_points)
+        np.savez_compressed(out / "geometry_distances.npz",
+                            dist_pred_to_gt=geometry.dist_pred_to_gt,
+                            dist_gt_to_pred=geometry.dist_gt_to_pred)
+        # Blue = close to GT; red = error at least 3 times the metric threshold.
+        error_fraction = np.clip(geometry.dist_pred_to_gt / (3 * args.recon_threshold), 0, 1)
+        colors = np.zeros((len(world_points), 3), dtype=np.uint8)
+        colors[:, 0] = np.rint(255 * error_fraction).astype(np.uint8)
+        colors[:, 2] = np.rint(255 * (1 - error_fraction)).astype(np.uint8)
+        write_ply_points(out / "points_by_error.ply", world_points, colors)
+        write_json(out / "geometry_metrics.json", geometry.summary())
+        manifest.add_param("recon_threshold_m", args.recon_threshold)
+        manifest.add_param("alignment_method", "one camera-centre Umeyama Sim(3); no mesh ICP")
+        manifest.add_param("gt_sample_count", len(gt_points))
+        manifest.add_param("error_colors", "blue=0m, red>=3*threshold; full point cloud, no error filtering")
+        manifest.add_result("d2", alignment)
+        manifest.add_result("d3", geometry.summary())
+        manifest.save(out)
+        print(f"Alignment: scale={alignment['scale_factor']:.4f}, "
+              f"ATE={alignment['ate_rmse_m']:.4f} m, "
+              f"rotation={alignment['mean_rotation_error_deg']:.2f} deg", flush=True)
+        print(f"Geometry: {geometry.summary()}", flush=True)
+    else:
+        print("Points are NOT metric-aligned: add --evaluate for D2/D3.", flush=True)
+    print(f"Saved results to {out.resolve()}", flush=True)
 
 
 if __name__ == "__main__":
