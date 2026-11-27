@@ -37,6 +37,8 @@ def main() -> int:
     ap.add_argument("--b-voxel-sizes", nargs="+", type=float, default=[0.05],
                     help="Metres; train an independent Part B model for each size")
     ap.add_argument("--b-epochs", type=int, default=50)
+    ap.add_argument("--b-features", choices=["rgb", "xyz"], default="rgb",
+                    help="Use xyz for the shared ScanNet++ semantic data")
     ap.add_argument("--b-lr", type=float, default=0.001)
     ap.add_argument("--b-weight-decay", type=float, default=0.0001)
     ap.add_argument("--b-patience", type=int, default=10,
@@ -109,6 +111,7 @@ def _run_part(part, args, manifest, table) -> None:
             channels=args.b_channels, seed=args.seed,
             task_classes=args.b_task_classes, resume=args.b_resume,
             evaluate_only=args.b_evaluate_only,
+            feature_mode=args.b_features,
         )
         manifest.add_param("part_b_dataset", str(args.data.resolve()))
         manifest.add_param("part_b_voxel_sizes_m", args.b_voxel_sizes)

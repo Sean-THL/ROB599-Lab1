@@ -706,3 +706,93 @@ No inference or tests were run when this implementation was written.
 
 Implementation references: [official VGGT model and quick start](https://github.com/facebookresearch/vggt)
 and [camera decoding at the environment's pinned revision](https://github.com/facebookresearch/vggt/blob/a288dd0f14786c93483e45524328726ab7b1b4ce/vggt/utils/pose_enc.py).
+
+## Prepare one ScanNet++ evaluation scene
+
+Use a complete scene such as `a08dda47a8` from the shared Great Lakes copy.
+Exclude this scene from all Part B splits. Copy only this scene to the local GPU
+computer; retain the previous ScanNet v2 exports in separate folders.
+
+```bash
+python -m pip install lz4
+python scripts/prepare_scannetpp_scene.py \
+  --scene-dir ~/ROB599/raw/scannetpp/a08dda47a8 \
+  --out ~/ROB599/data/scannetpp_a08dda47a8 \
+  --max-frames 200 --frame-step 10 --test-every 8 \
+  --width 640 --height 480
+```
+
+FFmpeg and FFprobe must be on PATH. This script reads selected measured-depth
+frames from the official whole-stream raw-DEFLATE or per-frame LZ4/raw-DEFLATE
+formats, and decodes selected RGB frames. Depth uses nearest-neighbour resampling,
+zero for missing samples and millimetre PNG units. Per-frame intrinsics are
+resampled into one shared K because `EvalScene` expects a single camera matrix.
+Poses come from `aligned_pose`, never raw unaligned ARKit poses. The default
+camera-axis conversion is OpenGL to OpenCV, matching the instructor guidance;
+`--pose-convention opencv` explicitly disables this flip if an alignment check
+shows this copy already uses OpenCV camera axes. Do not change conventions simply
+to optimize reconstruction scores; inspect sensor points against the mesh first.
+
+The default selection takes every tenth valid pose, then evenly subsamples to
+at most 200 views. Every eighth exported view is held out: 175 training and 25
+held-out views when 200 are available. This is a recorded custom frame split,
+not the dataset's official novel-view benchmark. Exported `scene_preparation.json`
+records IDs, convention and settings; `eval_scene/` loads with the existing C/D
+code. `mesh.ply` is a copy of the original GT mesh for evaluation, never a source
+of sensor depth or initialization points. Output must be a new directory.
+
+The exporter has only been checked for Python syntax, not run on the raw data.
+Format references: [official depth decoder](https://github.com/scannetpp/scannetpp/blob/main/iphone/prepare_iphone_data.py)
+and [dataset documentation](https://scannetpp.mlsg.cit.tum.de/scannetpp/documentation).
+
+## ScanNet++ Part B: top-100 labels and geometry-only features
+
+The course `segmentation/` NPZ colors encode class labels. Never train on those
+colors. `scripts/prepare_scannetpp100.py` remaps raw integer labels via the raw
+class-name list, `semantic_map_to` CSV column and benchmark `top100.txt` ordering.
+Empty CSV targets use identity mapping; names outside top-100 map to -100.
+Output colors are zero placeholders for loader compatibility, not model inputs.
+
+On Great Lakes, after copying this script into the checkout:
+
+```bash
+conda activate /home/szlin/mamba_envs/rob498
+cd ~/ROB599-Lab1
+srun --account=engin1 --partition=standard \
+  --cpus-per-task=1 --mem=8G --time=00:30:00 \
+  python scripts/prepare_scannetpp100.py \
+  --source /scratch/rob498_rob598s002f26_class_root/rob498_rob598s002f26_class/shared_data \
+  --out /scratch/engin_root/engin1/szlin/ROB599-Lab1/data/scannetpp100_small \
+  --train-scenes 20 --val-scenes 10 --exclude-scene a08dda47a8 \
+  --max-points 200000 --seed 42
+```
+
+This reads one scene at a time, retains the source train/validation membership,
+and excludes the C/D/E scene from both splits. To limit RAM and GPU use, each
+scene is capped at a fixed uniformly sampled 200,000 points without replacement.
+This applies to validation too: report validation scores on this prepared point
+subset, not a full-resolution benchmark result. Use the SAME export for all
+voxel-size runs. Sampling can omit rare classes; inspect recorded class counts.
+Set `--max-points 0` to preserve all points if resources permit. Outputs include
+`preparation.json` with scene IDs/counts, `label_mapping.json`, and the loader's
+`segmentation/{classes.txt,train/,val/}` layout. The source is never changed.
+
+Copy the prepared folder to the GPU computer's `~/ROB599/data/scannetpp100_small/`.
+Update `lab1/part_b.py` and `lab1/segmentation.py` there before running:
+
+```bash
+python -u -m lab1.part_b \
+  --data ~/ROB599/data/scannetpp100_small \
+  --out ~/ROB599/results/scannetpp100_seed42 \
+  --features xyz --voxel-size 0.05 --epochs 2 --seed 42
+```
+
+This is a short pipeline check only. Use a NEW output root for final training.
+`--features xyz` averages scene-centred XYZ (metres) in each voxel, keeping three
+input channels and never reading semantic colors as features. Feature mode is
+recorded in run configs/checkpoints and reused in validation. The exporter marks
+this dataset as XYZ-only; the runner rejects accidental default RGB training.
+Other datasets keep the previous RGB default. The main lab driver also exposes
+`--b-features xyz`. Rebuild models with the recorded feature mode when loading
+checkpoints elsewhere; it is an attribute, not a learned state-dictionary tensor.
+No preparation, training, or tests were run while writing this migration.

@@ -63,7 +63,8 @@ def plot_history(history, path):
 
 def run_part_b(data_root, out, *, voxel_sizes=(0.05,), epochs=50, lr=0.001,
                weight_decay=0.0001, patience=10, channels=(32, 64, 128, 256),
-               seed=0, task_classes=None, resume=False, evaluate_only=False):
+               seed=0, task_classes=None, resume=False, evaluate_only=False,
+               feature_mode="rgb"):
     """Train independent models and return one metrics record per voxel size.
 
     Small prepared subsets are loaded into CPU RAM. This is not a lazy loader
@@ -76,6 +77,8 @@ def run_part_b(data_root, out, *, voxel_sizes=(0.05,), epochs=50, lr=0.001,
         raise RuntimeError("Request a GPU allocation before starting Part B")
     if epochs < 1 or lr <= 0 or weight_decay < 0:
         raise ValueError("Need epochs >= 1, lr > 0 and weight_decay >= 0")
+    if feature_mode not in ("rgb", "xyz"):
+        raise ValueError("feature_mode must be rgb or xyz")
     if patience is not None and patience < 1:
         raise ValueError("patience must be positive, or None to disable early stopping")
     if not voxel_sizes or len(set(voxel_sizes)) != len(voxel_sizes):
@@ -108,6 +111,8 @@ def run_part_b(data_root, out, *, voxel_sizes=(0.05,), epochs=50, lr=0.001,
           f"{len(classes)} classes; GPU: {torch.cuda.get_device_name(0)}", flush=True)
     preparation_path = data_root / "preparation.json"
     preparation = json.loads(preparation_path.read_text()) if preparation_path.exists() else None
+    if preparation and preparation.get("feature_mode") == "xyz" and feature_mode != "xyz":
+        raise ValueError("This dataset requires geometry-only inputs: pass --features xyz")
     records = []
 
     for size in voxel_sizes:
@@ -118,6 +123,7 @@ def run_part_b(data_root, out, *, voxel_sizes=(0.05,), epochs=50, lr=0.001,
             "data_root": str(data_root.resolve()), "voxel_size_m": float(size),
             "class_names": classes, "architecture": "compact_spconv_residual_unet",
             "channels": list(channels), "in_channels": 3,
+            "feature_mode": feature_mode,
             "from_pretrained": False, "seed": seed, "lr": lr,
             "weight_decay": weight_decay, "patience": patience,
             "train_scenes": [scene.name for scene in train_scenes],
@@ -128,7 +134,9 @@ def run_part_b(data_root, out, *, voxel_sizes=(0.05,), epochs=50, lr=0.001,
         if config_path.exists():
             if not (resume or evaluate_only):
                 raise FileExistsError(f"{run_dir} already exists; enable resume or choose a new --out")
-            if json.loads(config_path.read_text()) != config:
+            saved_config = json.loads(config_path.read_text())
+            saved_config.setdefault("feature_mode", "rgb")
+            if saved_config != config:
                 raise ValueError(f"Run conditions changed for {run_dir}; choose a new --out")
         elif resume or evaluate_only:
             raise FileNotFoundError(f"No saved run configuration in {run_dir}")
@@ -148,6 +156,7 @@ def run_part_b(data_root, out, *, voxel_sizes=(0.05,), epochs=50, lr=0.001,
         try:
             set_global_seed(seed)
             model = build_model(num_classes=len(classes), channels=tuple(channels)).cuda()
+            model.feature_mode = feature_mode
             best_path, last_path = run_dir / "best.pth", run_dir / "last.pth"
             if evaluate_only:
                 saved = torch.load(best_path, map_location="cpu", weights_only=False)
@@ -182,6 +191,7 @@ def run_part_b(data_root, out, *, voxel_sizes=(0.05,), epochs=50, lr=0.001,
                 "task_miou": result.subset_miou(task_ids, len(classes)) if task_ids else None,
                 "train_scenes": config["train_scenes"], "val_scenes": config["val_scenes"],
                 "seed": seed, "from_pretrained": False,
+                "feature_mode": feature_mode,
                 "timing_scope": "mean forward time per scene; one warm-up; excludes preprocessing, transfers and point remapping",
             }
             save_json(run_dir / "metrics.json", record)
@@ -229,6 +239,8 @@ def main():
     parser.add_argument("--patience", type=int, default=10, help="0 disables early stopping")
     parser.add_argument("--channels", nargs="+", type=int, default=[32, 64, 128, 256])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--features", choices=["rgb", "xyz"], default="rgb",
+                        help="ScanNet++ shared data requires xyz to avoid label-color leakage")
     parser.add_argument("--task-classes", nargs="+", help="Exact class names for B3")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
@@ -239,6 +251,7 @@ def main():
         patience=None if args.patience == 0 else args.patience,
         channels=args.channels, seed=args.seed, task_classes=args.task_classes,
         resume=args.resume, evaluate_only=args.evaluate_only,
+        feature_mode=args.features,
     )
 
 

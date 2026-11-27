@@ -155,6 +155,7 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
+    feature_mode = getattr(model, "feature_mode", "rgb")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = torch.nn.CrossEntropyLoss()
     rng = np.random.default_rng(seed)
@@ -174,6 +175,7 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
         "voxel_size_m": float(voxel_size), "num_classes": num_classes,
         "in_channels": model.in_channels, "channels": tuple(model.channels),
         "from_pretrained": bool(getattr(model, "from_pretrained", False)),
+        "feature_mode": feature_mode,
         "seed": seed, "lr": lr, "weight_decay": weight_decay,
         "train_scenes": [scene.name for scene in train_scenes],
         "val_scenes": [scene.name for scene in val_scenes],
@@ -184,7 +186,8 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
         if "optimizer_state_dict" not in saved:
             raise ValueError("Resume from last.pth, which includes the optimizer state")
         for key, value in conditions.items():
-            if saved[key] != value:
+            recorded = saved.get(key, "rgb") if key == "feature_mode" else saved[key]
+            if recorded != value:
                 raise ValueError(f"Resume condition changed: {key}")
         model.load_state_dict(saved["model_state_dict"])
         optimizer.load_state_dict(saved["optimizer_state_dict"])
@@ -220,7 +223,7 @@ def train(model, train_loader, val_loader, epochs: int = 50, **kwargs):
         for index in rng.permutation(len(train_scenes)):
             scene = train_scenes[index]
             features, coordinates, inverse, labels = _prepare_scene(
-                scene, voxel_size, device
+                scene, voxel_size, device, feature_mode=feature_mode
             )
             valid = (labels >= 0) & (labels < num_classes)
             n_valid = int(valid.sum().item())
@@ -365,7 +368,8 @@ def evaluate(model, loader, voxel_size: float) -> SegmentationResult:
         with torch.no_grad():
             for scene in loader:
                 features, coordinates, inverse, labels = _prepare_scene(
-                    scene, voxel_size, device
+                    scene, voxel_size, device,
+                    feature_mode=getattr(model, "feature_mode", "rgb")
                 )
                 if not elapsed_ms:
                     warmup = model(features, coordinates)
@@ -479,10 +483,12 @@ def voxel_size_ablation(models, loader, voxel_sizes=(0.02, 0.05, 0.10), *,
     return records
 
 
-def _prepare_scene(scene, voxel_size, device):
+def _prepare_scene(scene, voxel_size, device, feature_mode="rgb"):
     """Turn one SegScene into model inputs and the original point labels.
 
     This simple pipeline uses mean RGB per voxel as its three input features.
+    For ScanNet++, choose feature_mode="xyz": use mean scene-centred XYZ in
+    metres instead. This branch never reads scene.color, which can encode labels.
     No points are cropped or sampled. Large scenes may need a later cropping
     strategy if full-scene training exceeds the GPU memory budget.
     """
@@ -492,14 +498,21 @@ def _prepare_scene(scene, voxel_size, device):
         raise ValueError("voxel_size must be positive and finite")
     if len(scene.coord) == 0:
         raise ValueError("Cannot prepare an empty scene")
+    if feature_mode not in ("rgb", "xyz"):
+        raise ValueError("feature_mode must be rgb or xyz")
 
     coordinates, inverse = voxelize(scene.coord, voxel_size)
     num_voxels = len(coordinates)
 
     # Average the colors of all points assigned to each voxel.
-    colors = np.asarray(scene.color, dtype=np.float32) / 255.0
+    # The XYZ branch instead averages positions; never use semantic palette RGB.
+    if feature_mode == "xyz":
+        values = np.asarray(scene.coord, dtype=np.float32)
+        values = values - values.mean(axis=0)
+    else:
+        values = np.asarray(scene.color, dtype=np.float32) / 255.0
     features = np.zeros((num_voxels, 3), dtype=np.float32)
-    np.add.at(features, inverse, colors)
+    np.add.at(features, inverse, values)
     counts = np.bincount(inverse, minlength=num_voxels)
     features /= counts[:, None]
 
