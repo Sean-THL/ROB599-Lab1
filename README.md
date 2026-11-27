@@ -667,3 +667,42 @@ at your own results helps.
 
 Bring the failing test, the command you ran, and the traceback. "Lab 1 doesn't
 work" is hard to help with; `pytest lab1/tests -k floater` and its output is easy.
+
+## D1: run VGGT from RGB images
+
+Use the released VGGT weights; do not train VGGT for this scene. From the
+repository root on the GPU computer:
+
+```bash
+conda activate rob498
+python -u -m lab1.feedforward \
+  --data ~/ROB599/data/scannet_scene0000_00 \
+  --n-views 4
+```
+
+The ScanNet v2 path above is for the existing development scene. When the
+ScanNet++ export is prepared, replace `--data` with that new data root. The
+function is dataset-independent once the images are exported.
+
+The CLI selects views evenly across the training list; held-out images, dataset
+poses, intrinsics and depth are not supplied to VGGT. Official RGB preprocessing
+resizes and centre-crops inputs. VGGT predicts cameras and depth, then its depth
+unprojection utility produces a point cloud in model coordinates. Output
+intrinsics apply to the processed images. The default confidence cutoff is 0;
+confidence is a model score, not a probability.
+
+Each invocation creates `results/d1_<timestamp>/` with `predictions.npz`,
+`points_model_frame.ply`, and `manifest.json`. The first run downloads released
+`facebook/VGGT-1B` weights. Timing excludes model loading/download but includes
+RGB preprocessing, transfers, inference and output conversion, without warmup.
+Peak memory is PyTorch's maximum allocated CUDA memory including model weights,
+not total process memory. Other live tensors also count toward this peak.
+
+Start with four views to check the pipeline. D1 also requires at least four
+view-count measurements and a scaling plot; those experiments have not been
+run. D2 alignment and D3 geometry evaluation are still separate work. A CUDA
+out-of-memory error is a capacity result to record, not a successful run.
+No inference or tests were run when this implementation was written.
+
+Implementation references: [official VGGT model and quick start](https://github.com/facebookresearch/vggt)
+and [camera decoding at the environment's pinned revision](https://github.com/facebookresearch/vggt/blob/a288dd0f14786c93483e45524328726ab7b1b4ce/vggt/utils/pose_enc.py).

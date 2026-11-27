@@ -105,6 +105,11 @@ def align_to_ground_truth(pred_poses: np.ndarray, gt_poses: np.ndarray) -> dict:
 def run_vggt(images, n_views: int | None = None, **kwargs) -> FeedForwardResult:
     """Run VGGT on the images, with no poses and no intrinsics.  [D1, 5 pts]
 
+    ``images`` is a list of RGB file paths. Optional keyword settings are
+    ``model`` (reuse loaded VGGT weights), ``view_ids`` (ordered frame names),
+    and ``confidence_threshold`` (depth-head score, default 0; not probability).
+    This implementation uses predicted depth and cameras for the point cloud.
+
     Return a :class:`FeedForwardResult` with camera-to-world ``poses``. VGGT's
     ``pose_encoding_to_extri_intri`` returns world-to-camera extrinsics, 3x4,
     OpenCV axes ("camera from world"): pad to 4x4 and invert. Record which
@@ -116,7 +121,92 @@ def run_vggt(images, n_views: int | None = None, **kwargs) -> FeedForwardResult:
     which the model stops fitting in memory is a deployment fact about the
     method, not an incidental detail of your GPU.
     """
-    raise NotImplementedError("Lab 1 D1: run the feed-forward reconstruction")
+    # images is a list of RGB image FILE PATHS, not ground-truth camera data.
+    # Optional settings: model (reuse loaded weights), view_ids, confidence_threshold.
+    import time
+    from pathlib import Path
+    import torch
+    from vggt.models.vggt import VGGT
+    from vggt.utils.load_fn import load_and_preprocess_images
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    from vggt.utils.geometry import unproject_depth_map_to_point_map
+
+    model = kwargs.pop("model", None)
+    view_ids = kwargs.pop("view_ids", None)
+    confidence_threshold = kwargs.pop("confidence_threshold", 0.0)
+    if kwargs:
+        raise TypeError(f"Unknown settings: {list(kwargs)}. Supply RGB paths only, no camera inputs.")
+    paths = list(images)
+    if not paths or not all(isinstance(path, (str, Path)) for path in paths):
+        raise ValueError("images must be a nonempty list of RGB image file paths")
+    if n_views is not None:
+        if not isinstance(n_views, int) or not 1 <= n_views <= len(paths):
+            raise ValueError("n_views must be between 1 and the number of images")
+        paths = paths[:n_views]
+    if view_ids is None:
+        view_ids = [Path(path).stem for path in paths]
+    else:
+        view_ids = list(view_ids)[:len(paths)]
+    if len(view_ids) != len(paths) or len(set(view_ids)) != len(view_ids):
+        raise ValueError("Need one unique view ID per selected image, in the same order")
+    if not np.isfinite(confidence_threshold) or confidence_threshold < 0:
+        raise ValueError("confidence_threshold must be finite and nonnegative")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Run VGGT in the rob498 environment on your NVIDIA GPU")
+
+    # 1. Load RELEASED weights, not a model trained from scratch for this scene.
+    # Download/model loading is excluded from the measured reconstruction time.
+    if model is None:
+        print("Loading facebook/VGGT-1B released weights (first use downloads them)", flush=True)
+        model = VGGT.from_pretrained("facebook/VGGT-1B")
+    model = model.to("cuda").eval()
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    start_time = time.perf_counter()
+
+    # 2. Use the official RGB resize/centre-crop preprocessing.
+    # Predicted intrinsics describe THESE processed images, not the original size.
+    image_tensor = load_and_preprocess_images([str(path) for path in paths]).to("cuda")
+    # Run VGGT on the images
+    with torch.inference_mode():
+        with torch.autocast(device_type="cuda", dtype=dtype):
+            predictions = model(image_tensor)
+        # 3. Decode the cameras estimated by VGGT, not dataset cameras.
+        extrinsics, intrinsics = pose_encoding_to_extri_intri(
+            predictions["pose_enc"].float(), image_tensor.shape[-2:]
+        )
+        extrinsics = extrinsics[0].float().cpu().numpy()
+        intrinsics = intrinsics[0].float().cpu().numpy()
+        depth = predictions["depth"][0].float().cpu().numpy()
+        confidence = predictions["depth_conf"][0].float().cpu().numpy()
+
+    # 4. Back-project PREDICTED depth using PREDICTED cameras.
+    # These coordinates have an unknown scale; they are not yet world metres.
+    point_maps = unproject_depth_map_to_point_map(depth, extrinsics, intrinsics)
+    valid = (np.isfinite(point_maps).all(axis=-1) & np.isfinite(depth[..., 0])
+             & (depth[..., 0] > 0) & np.isfinite(confidence)
+             & (confidence > confidence_threshold))
+    points = point_maps[valid].astype(np.float32)
+    confidence = confidence[valid].astype(np.float32)
+    if not len(points):
+        raise ValueError("No valid predicted points remain at this confidence threshold")
+
+    # 5. VGGT returns world-to-camera [R|t]. Our result needs camera-to-world.
+    world_to_camera = np.repeat(np.eye(4)[None], len(paths), axis=0)
+    world_to_camera[:, :3, :] = extrinsics
+    poses = np.linalg.inv(world_to_camera).astype(np.float32)
+    if not np.isfinite(poses).all() or not np.isfinite(intrinsics).all():
+        raise ValueError("VGGT produced non-finite camera predictions")
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start_time
+    peak_gpu_mb = torch.cuda.max_memory_allocated() / 1024 ** 2
+
+    return FeedForwardResult(
+        points=points, poses=poses, intrinsics=intrinsics, n_views=len(paths),
+        wall_clock_s=elapsed, peak_gpu_mb=peak_gpu_mb,
+        confidence=confidence, view_ids=view_ids,
+    )
 
 
 def evaluate_geometry(result: FeedForwardResult, gt_mesh_points: np.ndarray,
@@ -138,3 +228,62 @@ def evaluate_geometry(result: FeedForwardResult, gt_mesh_points: np.ndarray,
     are.
     """
     raise NotImplementedError("Lab 1 D3: evaluate the feed-forward geometry")
+
+
+def main():
+    """Run D1 from prepared scene images; save predictions without GT alignment."""
+    import argparse
+    from datetime import datetime
+    from pathlib import Path
+    from importlib.metadata import version
+    from lab1.dataset import load_eval_scene
+    from rob498.config import RunManifest
+    from rob498.io3d import write_ply_points
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, required=True,
+                        help="Prepared data root containing eval_scene/")
+    parser.add_argument("--n-views", type=int, default=4)
+    parser.add_argument("--out", type=Path, help="New output folder; default is timestamped")
+    parser.add_argument("--confidence-threshold", type=float, default=0.0,
+                        help="Keep depth confidence above this value; not a probability")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    scene = load_eval_scene(args.data)
+    if not 1 <= args.n_views <= len(scene.train):
+        parser.error(f"n-views must be between 1 and {len(scene.train)}")
+    if not np.isfinite(args.confidence_threshold) or args.confidence_threshold < 0:
+        parser.error("confidence-threshold must be finite and nonnegative")
+
+    # Spread selected views across the TRAINING sequence. Never use held-out RGB.
+    indices = np.linspace(0, len(scene.train) - 1, args.n_views, dtype=int)
+    names = [scene.train[index] for index in indices]
+    paths = [scene.image_path(name) for name in names]
+    out = args.out or Path("results") / datetime.now().strftime("d1_%Y%m%d_%H%M%S_%f")
+    out.mkdir(parents=True, exist_ok=False)
+    manifest = RunManifest(run_name="vggt_d1", seed=args.seed)
+    manifest.add_param("data_root", str(args.data.resolve()))
+    manifest.add_param("view_ids", names)
+    manifest.add_param("model", "facebook/VGGT-1B released weights")
+    manifest.add_param("vggt_version", version("vggt"))
+    manifest.add_param("preprocessing", "official load_and_preprocess_images, crop mode")
+    manifest.add_param("point_source", "predicted depth unprojected with predicted cameras")
+    manifest.add_param("confidence_threshold", args.confidence_threshold)
+    manifest.add_param("timing_scope", "RGB preprocessing, transfers, forward, decoding, point conversion; excludes model loading/download; no warmup")
+    manifest.add_param("memory_scope", "peak PyTorch CUDA allocation, includes model weights; excludes reserved memory and non-PyTorch allocations")
+    manifest.add_param("input_cameras", "none; scene cameras are not passed to VGGT")
+    manifest.save(out)
+    print(f"VGGT input: {len(names)} RGB images, no poses or intrinsics", flush=True)
+    result = run_vggt(paths, view_ids=names,
+                      confidence_threshold=args.confidence_threshold)
+    np.savez_compressed(out / "predictions.npz", **vars(result))
+    write_ply_points(out / "points_model_frame.ply", result.points)
+    manifest.add_result("d1", result.summary())
+    manifest.save(out)
+    print(result.summary(), flush=True)
+    print(f"Saved D1 results to {out.resolve()}", flush=True)
+    print("Points are NOT metric-aligned: D2 Sim(3) alignment and D3 evaluation remain.", flush=True)
+
+
+if __name__ == "__main__":
+    main()
