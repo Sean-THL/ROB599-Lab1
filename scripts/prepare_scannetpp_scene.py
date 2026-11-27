@@ -138,7 +138,7 @@ def main():
     parser.add_argument('--test-every', type=int, default=8)
     parser.add_argument('--width', type=int, default=640)
     parser.add_argument('--height', type=int, default=480)
-    parser.add_argument('--pose-convention', choices=('opengl', 'opencv'), default='opengl',
+    parser.add_argument('--pose-convention', choices=('opengl', 'opencv'), default='opencv',
                         help='Camera axes of aligned_pose; inspect sensor-to-mesh alignment')
     args = parser.parse_args()
     if args.max_frames < 2 or args.frame_step < 1 or args.test_every < 2:

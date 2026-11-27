@@ -728,9 +728,10 @@ formats, and decodes selected RGB frames. Depth uses nearest-neighbour resamplin
 zero for missing samples and millimetre PNG units. Per-frame intrinsics are
 resampled into one shared K because `EvalScene` expects a single camera matrix.
 Poses come from `aligned_pose`, never raw unaligned ARKit poses. The default
-camera-axis conversion is OpenGL to OpenCV, matching the instructor guidance;
-`--pose-convention opencv` explicitly disables this flip if an alignment check
-shows this copy already uses OpenCV camera axes. Do not change conventions simply
+for raw ARKit `aligned_pose` is OpenCV, verified on `a08dda47a8` by measured
+sensor-to-mesh alignment. Nerfstudio transforms use a different convention and
+still need the OpenGL-to-OpenCV conversion. `--pose-convention opengl` enables
+that flip only for source poses established to use OpenGL axes. Do not change conventions simply
 to optimize reconstruction scores; inspect sensor points against the mesh first.
 
 The default selection takes every tenth valid pose, then evenly subsamples to
@@ -837,3 +838,22 @@ prediction. Inspect colored error regions and describe failures for D3; scores
 alone do not complete that discussion. D1's four-count scaling experiment and
 the separate `run_lab1.py --part d` integration are still unfinished.
 Only syntax was checked for this change; no inference, evaluation or tests run.
+
+
+### Correction for old a08dda47a8 camera exports
+
+The initial exporter incorrectly applied an extra Y/Z axis flip to ARKit
+`aligned_pose`. Diagnostics on the shared scene showed that removing it reduced
+sensor-to-GT median distance from 0.3935 m to 0.0209 m and saved VGGT rotation
+error from 179.535 to 1.172 degrees. The exported and Nerfstudio camera centres
+also differ, so the latter must not be assumed to share this mesh frame.
+
+`scripts/fix_scannetpp_axes.py --data OLD_ROOT --out NEW_ROOT` copies an old
+OpenGL-tagged export into a new directory and removes the extra flip from each
+camera orientation. It refuses other scenes or already-corrected exports. Use
+the corrected root for C/D/E, keep the old data for provenance, and refit any C
+model initialized from the old ScanNet++ depth poses. VGGT inference itself
+uses only RGB, so existing raw VGGT predictions remain reusable. Flipping camera
+axes does not move their centres: the camera-centre Sim(3), ATE and D3 point
+scores therefore stay the same for the same saved predictions and GT samples.
+The correction script was syntax-checked only, not run locally.
